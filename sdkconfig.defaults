@@ -1,0 +1,10 @@
+# P1 sketch deltas (SPEC §10 + Oracle binding). Target set via `idf.py set-target esp32s3`.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+# SPEC §2.3: TX power <= 10 dBm (shared 3V3 rail browns out otherwise).
+# IDF v5.5 knob is CONFIG_ESP_PHY_MAX_WIFI_TX_POWER in dBm (=10dBm here).
+CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=10
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/16m.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

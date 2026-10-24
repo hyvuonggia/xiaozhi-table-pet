@@ -1,0 +1,23 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  # # Put list of dependencies here
+  # # For components maintained by Espressif:
+  # component: "~1.0.0"
+  # # For 3rd party components:
+  # username/component: ">=1.0.0,<2.0.0"
+  # username2/component2:
+  #   version: "~1.0.0"
+  #   # For transient dependencies `public` flag can be set.
+  #   # `public` flag doesn't have an effect dependencies of the `main` component.
+  #   # All dependencies of `main` are public by default.
+  #   public: true
+  espressif/esp_websocket_client: '*'
+  # AUDIO lane (P2): Opus encode/decode 16 kHz mono 60 ms (direct impl API:
+  # encoder/impl/esp_opus_enc.h, decoder/impl/esp_opus_dec.h).
+  espressif/esp_audio_codec: '^2.6.2'
+  # AUDIO lane (P2): 24 kHz -> 16 kHz resampler, polyphase Farrow
+  # (dsps_resampler_ph_init/exec, factor 16/24).
+  espressif/esp-dsp: '^1.8.2'

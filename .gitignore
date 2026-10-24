@@ -1,0 +1,6 @@
+.slim/deepwork/
+build*/
+sdkconfig
+sdkconfig.old
+managed_components/
+.DS_Store
