@@ -17,6 +17,7 @@
 #include "msg_filter.h"
 #include "display.h"
 #include "servo.h"
+#include "wakeword.h"
 #include "voice_path.h"
 
 static const char *TAG = "voice";
@@ -31,6 +32,8 @@ static const char *TAG = "voice";
 
 #define VP_LISTEN_START \
     "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}"
+#define VP_LISTEN_STOP \
+    "{\"type\":\"listen\",\"state\":\"stop\",\"mode\":\"auto\"}"
 
 static esp_websocket_client_handle_t s_ws;
 static bool s_task_on;
@@ -84,20 +87,37 @@ static void vp_send_listen_start(void)
     }
 }
 
-/* Local voice-activity gate (user decision 2026-10-25: function first).
- * No wake-word model on device (needs PSRAM + esp-sr + model partition — a
- * later project); instead the uplink only streams while mic energy exceeds
- * an adaptive noise floor, with 1 s hangover. Server VAD still segments.
- * Quiet room  -> IDLE screen, nothing sent (no more self-chatter).
- * Voice      -> LISTENING screen, opus streams.
+/* Explicit stop on window close: makes the server finalize the utterance and
+ * answer immediately instead of waiting for its own VAD timeout. */
+static void vp_send_listen_stop(void)
+{
+    if (vp_send_text(VP_LISTEN_STOP) >= 0) {
+        s_listening = false;
+        ESP_LOGI(TAG, "listen stop sent (window closed)");
+    }
+}
+
+/* Wake-word conversation window (WAKE lane, replaces energy auto-open).
+ * No WakeNet trigger -> no uplink: room noise can never open the stream.
+ * Window OPENS on wakeword_consume() ("WAKE -> window open"), stays open
+ * while mic RMS > floor*3+800 (speech continuing), and CLOSES after
+ * 1500 ms below that line ("window closed"). Server VAD still segments
+ * inside the window. Quiet room -> IDLE screen, nothing sent.
  * TTS playing -> SPEAKING screen, uplink paused (half-duplex echo guard). */
 static uint32_t s_floor;          /* adaptive noise floor (RMS units) */
-static bool s_voice;              /* energy above gate right now (or hangover) */
-static TickType_t s_voice_until;  /* hangover deadline */
+static bool s_window;             /* conversation window open (wake latched) */
+static TickType_t s_quiet_since;  /* last tick with RMS above keep threshold */
+static TickType_t s_window_open_tick; /* wake moment (minimum window guard) */
 static bool s_screen_listen;      /* last display_set_listening() value */
-#define VP_GATE_MARGIN_MUL 3u
-#define VP_GATE_MARGIN_ADD 800u
-#define VP_HANGOVER_MS     1000u
+#define VP_KEEP_MUL 3u
+#define VP_KEEP_ADD 800u
+/* Inside an open window the wake word already proved the user is talking, so
+ * be MORE sensitive (the laptop/TV can be quiet while the user speaks). */
+#define VP_INWIN_MUL 2u
+#define VP_INWIN_ADD 500u
+#define VP_WINDOW_QUIET_MS 2000u /* server VAD needs the stream through the
+                                    end of the sentence; 1.5 s cut it off */
+#define VP_WINDOW_MIN_MS   6000u /* user needs time to start talking */
 #define VP_FLOOR_SLOW_DIV  64u
 
 /* Uplink: drain audio_in_pop_opus() -> WS BINARY while session active
@@ -109,14 +129,15 @@ static void vp_uplink_task(void *arg)
     uint8_t buf[VP_OPUS_BUF];
     ESP_LOGI(TAG, "uplink task on (prio %d)", VP_UPLINK_PRIO);
     while (1) {
-        if (!s_ws || !s_session) {
+        if (!s_session) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (!s_listening) {
-            vp_send_listen_start();
+        if (!s_ws) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        /* Energy gate from the mic's smoothed RMS. */
+        /* Adaptive floor: drops fast to quieter rooms, rises slowly. */
         uint32_t rms = audio_in_recent_rms();
         if (s_floor == 0) {
             s_floor = rms;
@@ -125,23 +146,33 @@ static void vp_uplink_task(void *arg)
         } else {
             s_floor += (rms - s_floor) / VP_FLOOR_SLOW_DIV; /* rises slowly */
         }
-        uint32_t thresh = s_floor * VP_GATE_MARGIN_MUL + VP_GATE_MARGIN_ADD;
+        uint32_t keep = s_floor * VP_INWIN_MUL + VP_INWIN_ADD;
         TickType_t now = xTaskGetTickCount();
-        if (rms > thresh) {
-            if (!s_voice) {
-                ESP_LOGI(TAG, "voice gate OPEN (rms=%lu floor=%lu)",
+        /* Window opens ONLY on a WakeNet trigger — never on energy. */
+        if (wakeword_consume()) {
+            if (!s_window) {
+                ESP_LOGI(TAG, "WAKE -> window open (rms=%lu floor=%lu)",
                          (unsigned long)rms, (unsigned long)s_floor);
             }
-            s_voice = true;
-            s_voice_until = now + pdMS_TO_TICKS(VP_HANGOVER_MS);
-        } else if (s_voice && (int32_t)(now - s_voice_until) >= 0) {
-            ESP_LOGI(TAG, "voice gate CLOSED (rms=%lu floor=%lu)",
-                     (unsigned long)rms, (unsigned long)s_floor);
-            s_voice = false;
+            s_window = true;
+            s_window_open_tick = now;
+            s_quiet_since = now;
+            vp_send_listen_start(); /* explicit: server starts segmenting now */
+        } else if (s_window) {
+            if (rms > keep) {
+                s_quiet_since = now; /* speech continues: hold window */
+            } else if ((now - s_window_open_tick) >= pdMS_TO_TICKS(VP_WINDOW_MIN_MS)
+                       && (now - s_quiet_since) >= pdMS_TO_TICKS(VP_WINDOW_QUIET_MS)) {
+                s_window = false;
+                vp_send_listen_stop();
+                ESP_LOGI(TAG, "window closed (rms=%lu floor=%lu quiet %ums)",
+                         (unsigned long)rms, (unsigned long)s_floor,
+                         (unsigned)VP_WINDOW_QUIET_MS);
+            }
         }
-        if (s_voice != s_screen_listen) {
-            s_screen_listen = s_voice;
-            display_set_listening(s_voice);
+        if (s_window != s_screen_listen) {
+            s_screen_listen = s_window;
+            display_set_listening(s_window);
         }
         int n = audio_in_pop_opus(buf, sizeof(buf), VP_POP_TIMEOUT_MS);
         if (n <= 0) {
@@ -152,8 +183,8 @@ static void vp_uplink_task(void *arg)
             s_tx_gated++;
             continue;
         }
-        if (!s_voice) {
-            /* Quiet: pop-and-drop. Nothing sent, server stays silent. */
+        if (!s_window) {
+            /* Outside the wake window: pop-and-drop. Nothing sent. */
             s_tx_gated++;
             continue;
         }
@@ -164,11 +195,12 @@ static void vp_uplink_task(void *arg)
         } else {
             s_tx_frames++;
             s_tx_bytes += (uint32_t)n;
-            if (s_tx_frames == 1 || s_tx_frames % 500 == 0) {
-                ESP_LOGI(TAG, "up opus: frames=%lu bytes=%lu dropped=%lu",
+            if (s_tx_frames == 1 || s_tx_frames % 50 == 0) {
+                ESP_LOGI(TAG, "up opus: frames=%lu bytes=%lu dropped=%lu gated=%lu",
                          (unsigned long)s_tx_frames,
                          (unsigned long)s_tx_bytes,
-                         (unsigned long)s_tx_drop);
+                         (unsigned long)s_tx_drop,
+                         (unsigned long)s_tx_gated);
             }
         }
     }
@@ -177,6 +209,7 @@ static void vp_uplink_task(void *arg)
 void voice_path_start(esp_websocket_client_handle_t ws)
 {
     s_ws = ws;
+    wakeword_init(); /* idempotent; soft-fails to "no wake" if PSRAM/model bad */
     if (s_task_on) {
         return;
     }
@@ -200,7 +233,7 @@ void voice_path_on_ws_disconnected(void)
     s_session = false;
     s_listening = false;
     s_speaking = false; /* never stay half-duplex-gated across sessions */
-    s_voice = false;
+    s_window = false; /* wake window needs a fresh WAKE next session */
     s_floor = 0; /* re-learn the room on next session */
     if (s_screen_listen) {
         s_screen_listen = false;
@@ -222,7 +255,10 @@ void voice_path_relisten(void)
 
 bool voice_path_is_listening(void)
 {
-    return s_session && s_listening;
+    /* Mic must be alive whenever a session is live: with wake-word gating a
+     * dead mic means the robot can never hear "Alexa" again (deaf forever),
+     * so the watchdog needs this true outside the conversation window too. */
+    return s_session;
 }
 
 /* --- MCP (JSON-RPC over WS "mcp" frames, E1/E2) --- */

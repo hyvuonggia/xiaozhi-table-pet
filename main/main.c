@@ -664,9 +664,9 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
          * voice-path entry point; deferred to keep this hunk narrow. */
         if (ev->op_code == WS_TRANSPORT_OPCODES_BINARY) {
             voice_path_on_ws_binary((const uint8_t *)ev->data_ptr, (size_t)ev->data_len);
-        } else {
-            voice_path_on_ws_text((const char *)ev->data_ptr, (size_t)ev->data_len);
+            return; /* never parse/log opus as text (serial flood + CPU) */
         }
+        voice_path_on_ws_text((const char *)ev->data_ptr, (size_t)ev->data_len);
         char *msg = malloc((size_t)ev->data_len + 1);
         if (!msg) {
             return;

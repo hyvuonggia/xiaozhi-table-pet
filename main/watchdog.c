@@ -77,12 +77,21 @@ static void wd_reboot(uint32_t reason, const char *why)
     }
 }
 
+/* Unsigned tick subtraction is only safe when `now` was sampled after the
+ * stamp. The mic task (prio 8) can stamp BETWEEN our snapshot and this
+ * comparison, making `now - last` wrap to ~4 billion ticks and rebooting a
+ * perfectly healthy robot (seen live 2026-10-31). Always compare signed. */
+static inline bool wd_stale(TickType_t now, TickType_t stamp, uint32_t ms)
+{
+    return (int32_t)(now - stamp) > (int32_t)pdMS_TO_TICKS(ms);
+}
+
 static void wd_check_heartbeat(TickType_t now)
 {
     if (!s_heartbeat_seen) {
         return; /* main loop not up yet; grace until first stamp */
     }
-    if ((now - s_heartbeat_tick) > pdMS_TO_TICKS(WD_HEARTBEAT_MS)) {
+    if (wd_stale(now, s_heartbeat_tick, WD_HEARTBEAT_MS)) {
         wd_reboot(WD_REASON_HEARTBEAT, "main loop >30 s without heartbeat");
     }
 }
@@ -103,13 +112,13 @@ static void wd_check_mic(TickType_t now)
             s_mic_listen_since = now;
             return;
         }
-        if ((now - s_mic_listen_since) > pdMS_TO_TICKS(90000)) {
+        if (wd_stale(now, s_mic_listen_since, 90000)) {
             wd_reboot(WD_REASON_MIC, "mic never delivered in 90 s of session");
         }
         return;
     }
     s_mic_listen_since = 0;
-    if ((now - last) > pdMS_TO_TICKS(WD_MIC_MS)) {
+    if (wd_stale(now, last, WD_MIC_MS)) {
         wd_reboot(WD_REASON_MIC, "mic >25 s without successful read in session");
     }
 }
@@ -131,7 +140,7 @@ static void wd_check_display(TickType_t now)
         s_disp_last_comp = comp;
         s_disp_progress_tick = now;
         s_disp_unhealthy_since = 0;
-        if ((now - s_disp_healthy_since) > pdMS_TO_TICKS(WD_FORGIVE_MS)) {
+        if (wd_stale(now, s_disp_healthy_since, WD_FORGIVE_MS)) {
             s_disp_rescue_tried = false;
             s_disp_healthy_since = now;
             ESP_LOGI(TAG, "display healthy 10 min: counters forgiven");
@@ -152,7 +161,7 @@ static void wd_check_display(TickType_t now)
                  (unsigned long)req, (unsigned long)comp, (int)healthy);
         return;
     }
-    if ((now - s_disp_unhealthy_since) <= pdMS_TO_TICKS(WD_DISP_DEAD_MS)) {
+    if (!wd_stale(now, s_disp_unhealthy_since, WD_DISP_DEAD_MS)) {
         return;
     }
     if (!s_disp_rescue_tried) {

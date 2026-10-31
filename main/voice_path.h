@@ -10,9 +10,11 @@
  *
  * Protocol (SPEC section 3, E1/E2 research):
  *  - Uplink: raw Opus 16 kHz mono 60 ms frames as WS BINARY (v1, not
- *    base64). Auto-listen: after session established, send
- *    listen{state:start,mode:auto} once, then stream continuously;
- *    server-side VAD segments. On disconnect stop; re-listen on reconnect.
+ *    base64). Wake-word gated (WAKE lane): streaming starts ONLY on a
+ *    WakeNet "Alexa" trigger (listen{state:start,mode:auto}), continues
+ *    while the conversation window is open (min 6 s, +2 s quiet hangover),
+ *    then listen{state:stop,mode:auto} so the server answers immediately.
+ *    Room noise can never open the stream.
  *  - Downlink: binary frames -> audio_out_push_opus() (drop-on-full).
  *    Text frames: tts text is filtered by msg_filter_is_tool_json() first
  *    (E2 rule: never speak tool JSON); mcp JSON-RPC answered minimally.
@@ -20,7 +22,7 @@
  * BOOT short-press re-listen: buttons lane owns buttons.c; call
  * voice_path_relisten() from the button hook (orchestrator wires it).
  * Barge-in (abort while speaking on loud mic input) is SKIPPED: no VAD
- * yet. P3 owns it.
+ * on device. P3 owns it.
  *
  * Stability: finite waits/timeouts only, drop-on-full, soft-fail on
  * OOM/bad JSON/NULL, no shared mutex with display (lock contract).

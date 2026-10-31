@@ -8,3 +8,16 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/16m.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# WAKE lane: N16R8 has 8 MB octal PSRAM — WakeNet + srmodels need it.
+# NOTE (IDF 5.5): the master switch is the renamed alias
+# CONFIG_ESP32S3_SPIRAM_SUPPORT (maps to CONFIG_SPIRAM); writing
+# CONFIG_SPIRAM=y directly here is silently dropped — verified 2026-10-31.
+# If PSRAM is not found at boot the firmware panics here (by design:
+# IGNORE_NOTFOUND stays n) — do NOT silently continue without PSRAM.
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# WAKE lane: pack the wn9_alexa model into build/srmodels/srmodels.bin
+# (flashed to the "model" partition) for the "Alexa" wake phrase.
+CONFIG_SR_WN_WN9_ALEXA=y

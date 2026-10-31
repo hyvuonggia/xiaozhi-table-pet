@@ -21,3 +21,6 @@ dependencies:
   # AUDIO lane (P2): 24 kHz -> 16 kHz resampler, polyphase Farrow
   # (dsps_resampler_ph_init/exec, factor 16/24).
   espressif/esp-dsp: '^1.8.2'
+  # WAKE lane: WakeNet keyword spotting (16 kHz mono int16) + srmodels
+  # auto-pack/flash into the "model" partition (partitions/16m.csv).
+  espressif/esp-sr: '^2.6.1'

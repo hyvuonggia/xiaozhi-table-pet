@@ -19,6 +19,7 @@
 
 #include "audio_in.h"
 #include "audio_out.h"
+#include "wakeword.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -125,6 +126,7 @@ static void update_rms(const int16_t *pcm, int n)
 
 static void encode_frame(const int16_t *pcm16)
 {
+    wakeword_feed_pcm16(pcm16, FRAME16_SAMPLES); /* WAKE tap: 16k frame -> WakeNet */
     update_rms(pcm16, FRAME16_SAMPLES);
     if (!s_enc) {
         return;
