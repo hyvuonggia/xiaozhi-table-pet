@@ -19,15 +19,17 @@
  *  - Bus rescue: display_rescue_bus() = bus_reset -> 9 GPIO clocks + STOP
  *    -> re-enable pullups -> re-init. Returns ok/fail.
  *
- * Content (SPEC section 5.6): expressive eyes, status icon row
- * (wifi/session/mic/vol), night sleep 01:00-07:00 server-local time
- * (orchestrator/watchdog calls display_set_night_sleep; we blank via 0xAE),
- * contrast 0x81 0x4F. While speaking the eyes stay STATIC (no redraw).
- * Boot shows neutral eyes + icons. No LVGL: direct page framebuffer.
+ * Content (function-first pass, user decision 2026-10-25): NO expressive
+ * eyes — the panel shows one of three STATES with icon + caps label:
+ * SAN SANG (idle) / DANG NGHE (listening) / DANG NOI (speaking).
+ * Status icon row (wifi/session/mic/vol), night sleep 01:00-07:00
+ * server-local (caller calls display_set_night_sleep; we blank via 0xAE),
+ * contrast 0x81 0x4F. State transitions always repaint (even mid-speech);
+ * nothing else repaints while speaking. Boot shows SAN SANG + icons.
+ * No LVGL: direct page framebuffer.
  *
- * Emotion wiring: orchestrator routes llm/tts emotion strings here via
- * display_set_emotion(). Mic icon is informational (always lit while
- * awake); wifi/session/vol come from display_set_status().
+ * State wiring: voice path calls display_set_listening() (voice energy gate)
+ * and display_set_speaking() (TTS start/stop).
  */
 
 #include <stdbool.h>
@@ -38,21 +40,21 @@ extern "C" {
 #endif
 
 /* Idempotent. Inits pullups + I2C + SH1106, paints boot frame
- * (neutral eyes + icons), spawns the render task (prio 2). Soft-fails:
+ * (SAN SANG + icons), spawns the render task (prio 2). Soft-fails:
  * if the bus is down at boot the task keeps retrying; never aborts. */
 void display_init(void);
 
-/* Emotion name (case-insensitive): happy/sad/neutral/angry/relaxed/
- * surprised/sleepy/speaking. NULL/unknown -> neutral. Never panics.
- * While speaking the new emotion is stored but the repaint is deferred
- * (eyes stay static per SPEC section 5.6 #25). */
+/* Compatibility no-op (state screen ignores emotions). Logged only. */
 void display_set_emotion(const char *emotion);
+
+/* true = voice energy detected, uplink streaming. Drives DANG NGHE. */
+void display_set_listening(bool listening);
 
 /* Status row state. vol is clamped to 0..100. */
 void display_set_status(bool wifi, bool session, int vol);
 
-/* true while TTS audio is playing: freezes all eye redraws. The
- * false transition repaints with the latest emotion. */
+/* true while TTS audio is playing: drives DANG NOI. The
+ * false transition repaints with the latest state. */
 void display_set_speaking(bool speaking);
 
 /* true = night sleep: panel off (0xAE), frames skipped. false = panel

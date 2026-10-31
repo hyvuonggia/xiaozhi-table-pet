@@ -84,6 +84,22 @@ static void vp_send_listen_start(void)
     }
 }
 
+/* Local voice-activity gate (user decision 2026-10-25: function first).
+ * No wake-word model on device (needs PSRAM + esp-sr + model partition — a
+ * later project); instead the uplink only streams while mic energy exceeds
+ * an adaptive noise floor, with 1 s hangover. Server VAD still segments.
+ * Quiet room  -> IDLE screen, nothing sent (no more self-chatter).
+ * Voice      -> LISTENING screen, opus streams.
+ * TTS playing -> SPEAKING screen, uplink paused (half-duplex echo guard). */
+static uint32_t s_floor;          /* adaptive noise floor (RMS units) */
+static bool s_voice;              /* energy above gate right now (or hangover) */
+static TickType_t s_voice_until;  /* hangover deadline */
+static bool s_screen_listen;      /* last display_set_listening() value */
+#define VP_GATE_MARGIN_MUL 3u
+#define VP_GATE_MARGIN_ADD 800u
+#define VP_HANGOVER_MS     1000u
+#define VP_FLOOR_SLOW_DIV  64u
+
 /* Uplink: drain audio_in_pop_opus() -> WS BINARY while session active
  * AND listening. Never blocks the mic task (pop has a short timeout);
  * WS congestion drops the frame and counts it. */
@@ -100,12 +116,44 @@ static void vp_uplink_task(void *arg)
         if (!s_listening) {
             vp_send_listen_start();
         }
+        /* Energy gate from the mic's smoothed RMS. */
+        uint32_t rms = audio_in_recent_rms();
+        if (s_floor == 0) {
+            s_floor = rms;
+        } else if (rms < s_floor) {
+            s_floor = rms; /* quieter: floor drops fast */
+        } else {
+            s_floor += (rms - s_floor) / VP_FLOOR_SLOW_DIV; /* rises slowly */
+        }
+        uint32_t thresh = s_floor * VP_GATE_MARGIN_MUL + VP_GATE_MARGIN_ADD;
+        TickType_t now = xTaskGetTickCount();
+        if (rms > thresh) {
+            if (!s_voice) {
+                ESP_LOGI(TAG, "voice gate OPEN (rms=%lu floor=%lu)",
+                         (unsigned long)rms, (unsigned long)s_floor);
+            }
+            s_voice = true;
+            s_voice_until = now + pdMS_TO_TICKS(VP_HANGOVER_MS);
+        } else if (s_voice && (int32_t)(now - s_voice_until) >= 0) {
+            ESP_LOGI(TAG, "voice gate CLOSED (rms=%lu floor=%lu)",
+                     (unsigned long)rms, (unsigned long)s_floor);
+            s_voice = false;
+        }
+        if (s_voice != s_screen_listen) {
+            s_screen_listen = s_voice;
+            display_set_listening(s_voice);
+        }
         int n = audio_in_pop_opus(buf, sizeof(buf), VP_POP_TIMEOUT_MS);
         if (n <= 0) {
             continue; /* timeout/empty/not-running: no frame, no send */
         }
         if (s_speaking) {
             /* Half-duplex: pop-and-drop so the mic queue stays fresh. */
+            s_tx_gated++;
+            continue;
+        }
+        if (!s_voice) {
+            /* Quiet: pop-and-drop. Nothing sent, server stays silent. */
             s_tx_gated++;
             continue;
         }
@@ -152,6 +200,12 @@ void voice_path_on_ws_disconnected(void)
     s_session = false;
     s_listening = false;
     s_speaking = false; /* never stay half-duplex-gated across sessions */
+    s_voice = false;
+    s_floor = 0; /* re-learn the room on next session */
+    if (s_screen_listen) {
+        s_screen_listen = false;
+        display_set_listening(false);
+    }
     ESP_LOGI(TAG, "ws down: streaming stopped (up=%lu drop=%lu down=%lu drop=%lu)",
              (unsigned long)s_tx_frames, (unsigned long)s_tx_drop,
              (unsigned long)s_rx_frames, (unsigned long)s_rx_drop);

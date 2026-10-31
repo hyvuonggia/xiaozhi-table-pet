@@ -38,11 +38,16 @@ static const char *TAG = "display";
 #define DISP_RETRY_INIT_LOOPS 100     /* task tick 50 ms -> re-init ~5 s */
 #define DISP_DROP_LOG_EVERY   50      /* stuck bus must not spam the log */
 
-/* ---- emotion ---- */
+/* ---- screen state (function first, cosmetic later) ----
+ * The panel shows one of three states, never animations:
+ *   IDLE  "SAN SANG"  (quiet, mic gated)
+ *   LISTEN "DANG NGHE" (voice energy detected, streaming uplink)
+ *   SPEAK "DANG NOI"   (TTS audio playing)
+ * Priority SPEAK > LISTEN > IDLE. Emotion API is kept for compatibility but
+ * no longer drives pixels. */
 typedef enum {
-    EM_NEUTRAL = 0, EM_HAPPY, EM_SAD, EM_ANGRY,
-    EM_RELAXED, EM_SURPRISED, EM_SLEEPY, EM_SPEAKING,
-} disp_emotion_t;
+    ST_IDLE = 0, ST_LISTEN, ST_SPEAK,
+} disp_state_t;
 
 /* ---- state (all guarded by s_lock except volatile counters) ---- */
 static SemaphoreHandle_t s_lock;
@@ -51,7 +56,8 @@ static i2c_master_dev_handle_t s_dev;
 static bool s_inited;
 static bool s_hw_ok;                  /* bus+device+init-seq done */
 static uint8_t s_fb[DISP_PAGES * DISP_W];
-static disp_emotion_t s_emotion = EM_NEUTRAL;
+static bool s_listening;
+static int s_rendered = -1; /* last state painted on glass (-1 = never) */
 static bool s_wifi, s_session;
 static int s_vol = 50;                /* SPEC section 2.3 default */
 static bool s_speaking;
@@ -359,10 +365,6 @@ static void draw_vol(int x, int y, int vol)
 
 /* ---- content ---- */
 
-#define EYE_Y   40
-#define EYE_LX  40
-#define EYE_RX  88
-
 /* Status row (y 0..8): wifi arcs, session box, mic glyph, Vnn. */
 static void draw_status(bool wifi, bool session, int vol)
 {
@@ -395,86 +397,109 @@ static void draw_status(bool wifi, bool session, int vol)
     hline(0, DISP_W - 1, 9);
 }
 
-static void eye_open(int cx, int wide, int tall, int pupil)
+/* 5x7 LSB-top font, only the letters needed for state labels
+ * (DANG NGHE / DANG NOI / SAN SANG): A D E G H I N O S. */
+static const uint8_t FONT_A[5] = { 0x7E, 0x11, 0x11, 0x11, 0x7E };
+static const uint8_t FONT_D[5] = { 0x7F, 0x41, 0x41, 0x22, 0x1C };
+static const uint8_t FONT_E[5] = { 0x7F, 0x49, 0x49, 0x49, 0x41 };
+static const uint8_t FONT_G[5] = { 0x3E, 0x41, 0x49, 0x4B, 0x3A };
+static const uint8_t FONT_H[5] = { 0x7F, 0x08, 0x08, 0x08, 0x7F };
+static const uint8_t FONT_I[5] = { 0x00, 0x41, 0x7F, 0x41, 0x00 };
+static const uint8_t FONT_N[5] = { 0x7F, 0x10, 0x08, 0x04, 0x7F };
+static const uint8_t FONT_O[5] = { 0x3E, 0x41, 0x41, 0x41, 0x3E };
+static const uint8_t FONT_S[5] = { 0x46, 0x49, 0x49, 0x49, 0x31 };
+
+static const uint8_t *state_glyph(char c)
 {
-    /* outline oval: ring where (x/w)^2+(y/h)^2 ~= 1 */
-    for (int y = -tall; y <= tall; y++) {
-        for (int x = -wide; x <= wide; x++) {
-            int v = (x * x * tall * tall + y * y * wide * wide);
-            int edge = wide * wide * tall * tall;
-            if (v >= edge - 2 * edge / (wide + tall) && v <= edge) {
-                px(cx + x, EYE_Y + y, true);
-            }
-        }
+    switch (c) {
+    case 'A': return FONT_A;
+    case 'D': return FONT_D;
+    case 'E': return FONT_E;
+    case 'G': return FONT_G;
+    case 'H': return FONT_H;
+    case 'I': return FONT_I;
+    case 'N': return FONT_N;
+    case 'O': return FONT_O;
+    case 'S': return FONT_S;
+    default: return NULL; /* space + unknown: blank advance */
     }
-    filled_circle(cx, EYE_Y, pupil);
 }
 
-static void draw_eyes(disp_emotion_t em)
+/* Centered 5x7 caps label at row y (7 px tall). */
+static void draw_text(int y, const char *s)
 {
-    switch (em) {
-    case EM_HAPPY:
-        /* closed happy arcs ^^ */
-        arc(EYE_LX, EYE_Y + 4, 12, 200, 340);
-        arc(EYE_RX, EYE_Y + 4, 12, 200, 340);
+    size_t n = strlen(s);
+    int w = (int)n * 6 - 1;
+    int x = (DISP_W - w) / 2;
+    if (x < 0) {
+        x = 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *g = state_glyph(s[i]);
+        if (g) {
+            draw_glyph(x, y, g);
+        }
+        x += 6;
+    }
+}
+
+/* State art, content area y 12..52 (status row owns 0..9, label at 54). */
+static void draw_state(disp_state_t st)
+{
+    switch (st) {
+    case ST_SPEAK: {
+        /* megaphone + outgoing arcs (east bubble: octants 7 then 0..1) */
+        for (int y = 30; y <= 44; y++) {
+            hline(34, 40, y);
+        }
+        line(40, 30, 54, 24); line(40, 44, 54, 50);
+        line(54, 24, 54, 50);
+        arc(60, 37, 5, 315, 360); arc(60, 37, 5, 0, 45);
+        arc(60, 37, 10, 315, 360); arc(60, 37, 10, 0, 45);
+        arc(60, 37, 15, 315, 360); arc(60, 37, 15, 0, 45);
+        draw_text(54, "DANG NOI");
         break;
-    case EM_SAD:
-        eye_open(EYE_LX, 11, 13, 4);
-        eye_open(EYE_RX, 11, 13, 4);
-        line(EYE_LX - 12, EYE_Y - 18, EYE_LX + 12, EYE_Y - 12);
-        line(EYE_RX - 12, EYE_Y - 12, EYE_RX + 12, EYE_Y - 18);
+    }
+    case ST_LISTEN: {
+        /* big mic capsule + sound bars both sides */
+        for (int y = 22; y <= 36; y++) {
+            hline(60, 68, y);
+        }
+        arc(64, 36, 4, 0, 180);
+        hline(60, 68, 37);
+        line(64, 41, 64, 46); hline(58, 70, 46);
+        line(50, 26, 50, 42); line(78, 26, 78, 42);
+        line(44, 29, 44, 39); line(84, 29, 84, 39);
+        draw_text(54, "DANG NGHE");
         break;
-    case EM_ANGRY:
-        eye_open(EYE_LX, 11, 12, 5);
-        eye_open(EYE_RX, 11, 12, 5);
-        line(EYE_LX - 13, EYE_Y - 20, EYE_LX + 13, EYE_Y - 10);
-        line(EYE_RX - 13, EYE_Y - 10, EYE_RX + 13, EYE_Y - 20);
-        break;
-    case EM_RELAXED:
-        /* half-mast: lower arc + lid line */
-        arc(EYE_LX, EYE_Y + 2, 11, 20, 160);
-        arc(EYE_RX, EYE_Y + 2, 11, 20, 160);
-        hline(EYE_LX - 11, EYE_LX + 11, EYE_Y + 2);
-        hline(EYE_RX - 11, EYE_RX + 11, EYE_Y + 2);
-        break;
-    case EM_SURPRISED:
-        circle(EYE_LX, EYE_Y, 16);
-        circle(EYE_RX, EYE_Y, 16);
-        filled_circle(EYE_LX, EYE_Y + 2, 4);
-        filled_circle(EYE_RX, EYE_Y + 2, 4);
-        break;
-    case EM_SLEEPY:
-        /* closed lids, slight curve */
-        arc(EYE_LX, EYE_Y - 2, 12, 20, 160);
-        arc(EYE_RX, EYE_Y - 2, 12, 20, 160);
-        hline(EYE_LX - 12, EYE_LX + 12, EYE_Y + 2);
-        hline(EYE_RX - 12, EYE_RX + 12, EYE_Y + 2);
-        break;
-    case EM_SPEAKING:
-    case EM_NEUTRAL:
+    }
+    case ST_IDLE:
     default:
-        eye_open(EYE_LX, 13, 17, 5);
-        eye_open(EYE_RX, 13, 17, 5);
+        /* check in ring = ready */
+        circle(64, 34, 13);
+        line(56, 34, 62, 40);
+        line(62, 40, 73, 27);
+        draw_text(54, "SAN SANG");
         break;
     }
 }
 
 /* Compose the full framebuffer from the snapshot. */
-static void compose_frame(disp_emotion_t em, bool wifi, bool session, int vol)
+static void compose_frame(disp_state_t st, bool wifi, bool session, int vol)
 {
     memset(s_fb, 0, sizeof(s_fb));
     draw_status(wifi, session, vol);
-    draw_eyes(em);
+    draw_state(st);
 }
 
 /* Attempt one full frame. Bus-high check first; false = dropped (dirty
  * kept). Assumes s_hw_ok. */
-static bool render_frame(disp_emotion_t em, bool wifi, bool session, int vol)
+static bool render_frame(disp_state_t st, bool wifi, bool session, int vol)
 {
     if (!bus_high()) {
         return false;
     }
-    compose_frame(em, wifi, session, vol);
+    compose_frame(st, wifi, session, vol);
     for (int p = 0; p < DISP_PAGES; p++) {
         if (!disp_write_page(p, &s_fb[p * DISP_W])) {
             return false;
@@ -529,26 +554,30 @@ static void disp_task(void *arg)
             continue;
         }
         bool want = s_dirty && s_hw_ok && !s_night && !s_panel_off
-            && !s_speaking; /* STATIC while speaking (SPEC 5.6 #25) */
+            && ((s_speaking ? ST_SPEAK : (s_listening ? ST_LISTEN : ST_IDLE)) != s_rendered
+                || !s_speaking);
+        /* While speaking only state transitions repaint (bus quiet rule);
+         * state flips always repaint so NGHE/NOI/NGHI stays truthful. */
         uint32_t gap = now_ms() - s_last_attempt_ms;
         if (!want || gap < DISP_MIN_GAP_MS) {
             xSemaphoreGive(s_lock);
             continue;
         }
         /* Snapshot under lock, release before the slow I2C. */
-        disp_emotion_t em = s_emotion;
+        disp_state_t st = s_speaking ? ST_SPEAK : (s_listening ? ST_LISTEN : ST_IDLE);
         bool wifi = s_wifi, sess = s_session;
         int vol = s_vol;
         xSemaphoreGive(s_lock);
 
         s_last_attempt_ms = now_ms();
-        bool ok = render_frame(em, wifi, sess, vol);
+        bool ok = render_frame(st, wifi, sess, vol);
 
         if (take_lock()) {
             if (ok) {
                 s_completed++;
                 s_last_complete_ms = now_ms();
                 s_consec_err = 0;
+                s_rendered = (int)st;
                 /* Clear dirty only if nobody re-dirtied mid-frame. */
                 s_dirty = false;
                 ESP_LOGI(TAG, "frame ok: req=%lu done=%lu drops=%lu",
@@ -609,51 +638,28 @@ void display_init(void)
         ESP_LOGW(TAG, "task create failed (setters still safe)");
         return;
     }
-    ESP_LOGI(TAG, "init OK: boot neutral eyes + icons wanted "
+    ESP_LOGI(TAG, "init OK: boot state screen wanted "
              "(req=%lu)", (unsigned long)s_requested);
 }
 
-static disp_emotion_t parse_emotion(const char *e)
-{
-    if (!e) {
-        return EM_NEUTRAL;
-    }
-    if (strcasecmp(e, "happy") == 0) {
-        return EM_HAPPY;
-    }
-    if (strcasecmp(e, "sad") == 0) {
-        return EM_SAD;
-    }
-    if (strcasecmp(e, "angry") == 0) {
-        return EM_ANGRY;
-    }
-    if (strcasecmp(e, "relaxed") == 0) {
-        return EM_RELAXED;
-    }
-    if (strcasecmp(e, "surprised") == 0) {
-        return EM_SURPRISED;
-    }
-    if (strcasecmp(e, "sleepy") == 0) {
-        return EM_SLEEPY;
-    }
-    if (strcasecmp(e, "speaking") == 0) {
-        return EM_SPEAKING;
-    }
-    return EM_NEUTRAL; /* neutral + unknown (incl. "neutral") */
-}
-
+/* Emotion API kept for compatibility; the state screen ignores it
+ * (function-first pass: no cosmetic faces). Logged only. */
 void display_set_emotion(const char *emotion)
 {
-    disp_emotion_t em = parse_emotion(emotion);
+    ESP_LOGI(TAG, "emotion=%s (ignored: state screen active)",
+             emotion ? emotion : "(null)");
+}
+
+void display_set_listening(bool listening)
+{
     if (!take_lock()) {
-        ESP_LOGW(TAG, "set_emotion skipped: lock busy");
+        ESP_LOGW(TAG, "set_listening skipped: lock busy");
         return;
     }
-    if (em != s_emotion) {
-        s_emotion = em;
-        mark_dirty_locked(); /* deferred while speaking (static) */
-        ESP_LOGI(TAG, "emotion=%d%s", (int)em,
-                 s_speaking ? " (deferred: speaking)" : "");
+    if (listening != s_listening) {
+        s_listening = listening;
+        mark_dirty_locked();
+        ESP_LOGI(TAG, "listening=%d", listening ? 1 : 0);
     }
     xSemaphoreGive(s_lock);
 }
@@ -687,9 +693,7 @@ void display_set_speaking(bool speaking)
     }
     if (speaking != s_speaking) {
         s_speaking = speaking;
-        if (!speaking) {
-            mark_dirty_locked(); /* speech over -> repaint latest */
-        }
+        mark_dirty_locked(); /* state flip always repaints (even mid-speech) */
         ESP_LOGI(TAG, "speaking=%d", speaking ? 1 : 0);
     }
     xSemaphoreGive(s_lock);
