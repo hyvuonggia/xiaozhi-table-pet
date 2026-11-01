@@ -61,17 +61,17 @@ static i2c_master_dev_handle_t s_dev;
 static bool s_inited;
 static bool s_hw_ok;                  /* bus+device+init-seq done */
 static uint8_t s_fb[DISP_PAGES * DISP_W];
-static bool s_listening;
-static bool s_thinking;
-static bool s_offline;
+static volatile bool s_listening;
+static volatile bool s_thinking;
+static volatile bool s_offline;
 static int s_dot_phase;
 static int s_rendered = -1; /* last state painted on glass (-1 = never) */
 static bool s_wifi, s_session;
 static int s_vol = 50;                /* SPEC section 2.3 default */
-static bool s_speaking;
+static volatile bool s_speaking;
 static bool s_night;
 static bool s_panel_off;              /* 0xAE already sent */
-static bool s_dirty = true;           /* boot frame wanted */
+static volatile bool s_dirty = true;  /* boot frame wanted */
 static volatile uint32_t s_requested = 1;  /* boot frame */
 static volatile uint32_t s_completed;
 static uint32_t s_drops;
@@ -90,6 +90,15 @@ static uint32_t now_ms(void)
 }
 
 /* Mark dirty + count a wanted frame. Call with s_lock held. */
+/* Lock-free: state setters must never drop an update because the render task
+ * happens to hold the lock (user saw the screen stuck on DANG NGHI). */
+static void mark_dirty_any(void)
+{
+    s_dirty = true;
+    s_requested++;
+    s_last_request_ms = now_ms();
+}
+
 static void mark_dirty_locked(void)
 {
     if (!s_dirty) {
@@ -619,8 +628,12 @@ static void disp_task(void *arg)
                 || !s_speaking);
         /* While speaking only state transitions repaint (bus quiet rule);
          * state flips always repaint so NGHE/NOI/NGHI stays truthful. */
+        /* State flips are rare and must feel immediate; the 200 ms budget
+         * only throttles the thinking-dot animation. */
+        uint32_t gap_need = (display_state_locked() != s_rendered)
+                                ? 40u : DISP_MIN_GAP_MS;
         uint32_t gap = now_ms() - s_last_attempt_ms;
-        if (!want || gap < DISP_MIN_GAP_MS) {
+        if (!want || gap < gap_need) {
             xSemaphoreGive(s_lock);
             continue;
         }
@@ -638,7 +651,13 @@ static void disp_task(void *arg)
                 s_completed++;
                 s_last_complete_ms = now_ms();
                 s_consec_err = 0;
-                s_rendered = (int)st;
+                if (s_rendered != (int)st) {
+                    s_rendered = (int)st;
+                    static const char *names[] = {
+                        "SAN SANG", "DANG NGHE", "DANG NGHI", "DANG NOI", "MAT KET NOI"
+                    };
+                    ESP_LOGI(TAG, "painted: %s", names[(int)st]);
+                }
                 /* Clear dirty only if nobody re-dirtied mid-frame. */
                 s_dirty = false;
                 ESP_LOGI(TAG, "frame ok: req=%lu done=%lu drops=%lu",
@@ -713,16 +732,11 @@ void display_set_emotion(const char *emotion)
 
 void display_set_listening(bool listening)
 {
-    if (!take_lock()) {
-        ESP_LOGW(TAG, "set_listening skipped: lock busy");
-        return;
-    }
     if (listening != s_listening) {
         s_listening = listening;
-        mark_dirty_locked();
+        mark_dirty_any();
         ESP_LOGI(TAG, "listening=%d", listening ? 1 : 0);
     }
-    xSemaphoreGive(s_lock);
 }
 
 /* Priority: speaking > thinking > listening > offline > idle. */
@@ -745,28 +759,20 @@ static disp_state_t display_state_locked(void)
 
 void display_set_thinking(bool thinking)
 {
-    if (!take_lock()) {
-        return;
-    }
     if (thinking != s_thinking) {
         s_thinking = thinking;
-        mark_dirty_locked();
+        mark_dirty_any();
         ESP_LOGI(TAG, "thinking=%d", thinking ? 1 : 0);
     }
-    xSemaphoreGive(s_lock);
 }
 
 void display_set_offline(bool offline)
 {
-    if (!take_lock()) {
-        return;
-    }
     if (offline != s_offline) {
         s_offline = offline;
-        mark_dirty_locked();
+        mark_dirty_any();
         ESP_LOGI(TAG, "offline=%d", offline ? 1 : 0);
     }
-    xSemaphoreGive(s_lock);
 }
 
 void display_set_status(bool wifi, bool session, int vol)
@@ -792,16 +798,11 @@ void display_set_status(bool wifi, bool session, int vol)
 
 void display_set_speaking(bool speaking)
 {
-    if (!take_lock()) {
-        ESP_LOGW(TAG, "set_speaking skipped: lock busy");
-        return;
-    }
     if (speaking != s_speaking) {
         s_speaking = speaking;
-        mark_dirty_locked(); /* state flip always repaints (even mid-speech) */
+        mark_dirty_any(); /* state flip always repaints (even mid-speech) */
         ESP_LOGI(TAG, "speaking=%d", speaking ? 1 : 0);
     }
-    xSemaphoreGive(s_lock);
 }
 
 void display_set_night_sleep(bool sleeping)
