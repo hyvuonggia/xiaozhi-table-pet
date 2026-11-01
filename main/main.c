@@ -611,6 +611,8 @@ static void ota_fetch_blocking(const char *ota_url)
  * conversation window closes. */
 static volatile bool s_ws_intentional_close;
 
+bool ws_link_faulty(void);
+
 /* Audio-channel lifecycle used by the voice path (wake opens, idle closes).
  * The voice path only flips a request flag: creating/destroying the client
  * from the audio task deadlocked the device (live-tested 2026-10-31). A small
@@ -620,6 +622,15 @@ void ws_close_idle(void);
 static void ws_client_create(void);
 static volatile bool s_ws_want_open;
 static bool s_ws_ctl_on;
+static volatile int s_ws_fail;      /* consecutive failed open attempts */
+static TickType_t s_ws_open_tick;   /* when the current open attempt started */
+
+/* True when the assistant is unreachable even though WiFi is up, so the
+ * screen can say MAT KET NOI instead of pretending everything is fine. */
+bool ws_link_faulty(void)
+{
+    return s_ws_fail >= 3;
+}
 
 static void ws_control_task(void *arg)
 {
@@ -629,10 +640,26 @@ static void ws_control_task(void *arg)
             s_ws_intentional_close = false;
             s_got_session_id = false;
             ws_client_create(); /* lazy: no idle client eating internal RAM */
+            s_ws_open_tick = xTaskGetTickCount();
             if (s_ws) {
                 esp_err_t err = esp_websocket_client_start(s_ws);
                 ESP_LOGI(TAG, "ws open (wake): %s", esp_err_to_name(err));
+                if (err != ESP_OK && s_ws_fail < 99) {
+                    s_ws_fail++;
+                }
+            } else if (s_ws_fail < 99) {
+                s_ws_fail++;
             }
+        } else if (s_ws_want_open && s_ws && !s_got_session_id
+                   && s_ws_open_tick != 0
+                   && (int32_t)(xTaskGetTickCount() - s_ws_open_tick)
+                          > (int32_t)pdMS_TO_TICKS(6000)) {
+            /* Connected but no hello/session within 6 s: server unhealthy. */
+            if (s_ws_fail < 99) {
+                s_ws_fail++;
+            }
+            s_ws_open_tick = xTaskGetTickCount();
+            ESP_LOGW(TAG, "ws open but no session in 6 s (fail=%d)", s_ws_fail);
         } else if (!s_ws_want_open && s_ws) {
             esp_websocket_client_handle_t h = s_ws;
             s_ws = NULL;
@@ -712,6 +739,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         cJSON *sid = cJSON_GetObjectItemCaseSensitive(root, "session_id");
         if (cJSON_IsString(sid)) {
             s_got_session_id = true;
+            s_ws_fail = 0; /* healthy again */
             ESP_LOGI(TAG, "session_id=%s", sid->valuestring);
         }
         cJSON *ap = cJSON_GetObjectItemCaseSensitive(root, "audio_params");
@@ -877,7 +905,7 @@ void app_main(void)
         /* Status icons + night sleep 01:00-07:00 server-local (SPEC §5.6#23).
          * time() is real epoch after SNTP + timezone_offset (B3). */
         display_set_status(wifi, s_got_session_id, buttons_get_volume());
-        display_set_offline(!wifi); /* MAT KET NOI while the link is down */
+        display_set_offline(!wifi || ws_link_faulty()); /* MAT KET NOI */
         time_t now = time(NULL);
         if (now > 1700000000) {
             struct tm tmv;
