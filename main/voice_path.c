@@ -213,6 +213,10 @@ static void vp_uplink_task(void *arg)
                 s_streaming = false;
                 s_armed = false;
                 vp_set_screen_listen(false);
+                if (s_speaking) {
+                    display_set_speaking(false);
+                    s_speaking = false;
+                }
                 ESP_LOGI(TAG, "no speech after wake: silent abort");
                 if (s_close_cb) {
                     s_close_cb();
@@ -245,6 +249,10 @@ static void vp_uplink_task(void *arg)
                     ESP_LOGI(TAG, "window closed: only %lums speech, silent abort",
                              (unsigned long)s_speech_ms);
                     vp_set_screen_listen(false);
+                    if (s_speaking) {
+                        display_set_speaking(false);
+                        s_speaking = false;
+                    }
                     s_closing = false;
                     if (s_close_cb) {
                         s_close_cb();
@@ -269,6 +277,10 @@ static void vp_uplink_task(void *arg)
                 s_close_at = now + pdMS_TO_TICKS(3000); /* reply still playing */
             } else if ((int32_t)(now - s_close_at) >= 0) {
                 s_closing = false;
+                if (s_speaking) {
+                    display_set_speaking(false); /* tts stop may never arrive */
+                    s_speaking = false;
+                }
                 if (s_close_cb) {
                     s_close_cb(); /* idle now: no server goodbye */
                 }
@@ -370,6 +382,9 @@ void voice_path_on_ws_disconnected(void)
      * Re-listen is automatic on session re-establish. */
     s_session = false;
     s_listening = false;
+    if (s_speaking) {
+        display_set_speaking(false); /* else the screen sticks on DANG NOI */
+    }
     s_speaking = false; /* never stay half-duplex-gated across sessions */
     s_armed = false;
     s_streaming = false; /* fresh WAKE required next session */
