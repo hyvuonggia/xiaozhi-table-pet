@@ -147,7 +147,7 @@ static TickType_t s_close_at;     /* when it is safe to drop the channel */
 /* The 30 s follow-up window must not reopen on a click/chair creak: a real
  * next sentence sustains VAD for >150 ms; 2 frames (~60 ms) was a blip
  * magnet (live: reopened 29 s into the window with zero STT). */
-#define VP_FOLLOWUP_CONFIRM_FRAMES 5u
+#define VP_FOLLOWUP_CONFIRM_FRAMES 3u
 /* While streaming, VAD speech within the last 500 ms counts as activity;
  * longer gaps let the 2 s quiet timer below run out and close the window. */
 #define VP_VAD_HOLD_MS      500u
@@ -268,6 +268,22 @@ static void vp_onset_flush(void)
         vTaskDelay(pdMS_TO_TICKS(40)); /* near real-time, no burst */
     }
     ESP_LOGI(TAG, "onset flush: %d frames", n);
+    vp_onset_reset();
+}
+
+/* Move the follow-up onset pre-roll into the channel-open ring so it is
+ * transmitted BEFORE the frames captured after the reopen. Flushing the two
+ * rings separately sent them out of order and the server transcribed
+ * garbage ("giờ đi rồi làm mấy giờ"). */
+static void vp_onset_to_pre(void)
+{
+    for (int i = 0; i < s_onset_count; i++) {
+        int idx = (s_onset_head + i) % VP_ONSET_N;
+        if (s_onset_len[idx] > 0) {
+            vp_pre_push(s_onset_buf + (size_t)idx * VP_OPUS_BUF,
+                        s_onset_len[idx]);
+        }
+    }
     vp_onset_reset();
 }
 
@@ -443,8 +459,14 @@ static void vp_uplink_task(void *arg)
 
         if (s_followup) {
             /* Never forward the reply's tail: keep the mic queue fresh so the
-             * reopen below starts on the user's voice, not our echo. */
-            while (audio_in_pop_opus(buf, sizeof(buf), 0) > 0) {
+             * reopen below starts on the user's voice, not our echo. After
+             * the guard, keep the newest 360 ms in the onset ring so the
+             * first syllable survives the VAD confirmation delay. */
+            int fn;
+            while ((fn = audio_in_pop_opus(buf, sizeof(buf), 0)) > 0) {
+                if ((int32_t)(now - s_followup_guard_until) >= 0) {
+                    vp_onset_push(buf, (size_t)fn);
+                }
             }
             if ((int32_t)(now - s_followup_guard_until) < 0) {
                 /* echo guard: ignore VAD while the speaker tail decays */
@@ -462,6 +484,7 @@ static void vp_uplink_task(void *arg)
                 s_quiet_since = now;
                 s_window_open_tick = now;
                 s_mute_until = 0;
+                vp_onset_to_pre(); /* chronological pre-roll for the open */
                 if (s_open_cb) {
                     s_open_cb();
                 }
