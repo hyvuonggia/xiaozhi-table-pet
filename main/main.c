@@ -877,6 +877,7 @@ void app_main(void)
         /* Status icons + night sleep 01:00-07:00 server-local (SPEC §5.6#23).
          * time() is real epoch after SNTP + timezone_offset (B3). */
         display_set_status(wifi, s_got_session_id, buttons_get_volume());
+        display_set_offline(!wifi); /* MAT KET NOI while the link is down */
         time_t now = time(NULL);
         if (now > 1700000000) {
             struct tm tmv;

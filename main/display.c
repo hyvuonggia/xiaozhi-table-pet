@@ -47,7 +47,11 @@ static const char *TAG = "display";
  * Priority SPEAK > LISTEN > IDLE. Emotion API is kept for compatibility but
  * no longer drives pixels. */
 typedef enum {
-    ST_IDLE = 0, ST_LISTEN, ST_SPEAK,
+    ST_IDLE = 0,      /* SAN SANG   - not in a conversation        */
+    ST_LISTEN,        /* DANG NGHE  - mic armed / user speaking     */
+    ST_THINK,         /* DANG NGHI  - speech sent, waiting for LLM  */
+    ST_SPEAK,         /* DANG NOI   - TTS playing                   */
+    ST_OFFLINE,       /* MAT KET NOI- no WiFi                       */
 } disp_state_t;
 
 /* ---- state (all guarded by s_lock except volatile counters) ---- */
@@ -58,6 +62,9 @@ static bool s_inited;
 static bool s_hw_ok;                  /* bus+device+init-seq done */
 static uint8_t s_fb[DISP_PAGES * DISP_W];
 static bool s_listening;
+static bool s_thinking;
+static bool s_offline;
+static int s_dot_phase;
 static int s_rendered = -1; /* last state painted on glass (-1 = never) */
 static bool s_wifi, s_session;
 static int s_vol = 50;                /* SPEC section 2.3 default */
@@ -73,6 +80,9 @@ static uint32_t s_boot_ms;
 static uint32_t s_last_request_ms;
 static uint32_t s_last_complete_ms;
 static uint32_t s_last_attempt_ms;
+
+static disp_state_t display_state_locked(void);
+static void gpio_clock_rescue(void);
 
 static uint32_t now_ms(void)
 {
@@ -409,6 +419,9 @@ static const uint8_t FONT_I[5] = { 0x00, 0x41, 0x7F, 0x41, 0x00 };
 static const uint8_t FONT_N[5] = { 0x7F, 0x10, 0x08, 0x04, 0x7F };
 static const uint8_t FONT_O[5] = { 0x3E, 0x41, 0x41, 0x41, 0x3E };
 static const uint8_t FONT_S[5] = { 0x46, 0x49, 0x49, 0x49, 0x31 };
+static const uint8_t FONT_M[5] = { 0x7F, 0x02, 0x0C, 0x02, 0x7F };
+static const uint8_t FONT_K[5] = { 0x7F, 0x08, 0x14, 0x22, 0x41 };
+static const uint8_t FONT_T[5] = { 0x01, 0x01, 0x7F, 0x01, 0x01 };
 
 static const uint8_t *state_glyph(char c)
 {
@@ -422,6 +435,9 @@ static const uint8_t *state_glyph(char c)
     case 'N': return FONT_N;
     case 'O': return FONT_O;
     case 'S': return FONT_S;
+    case 'M': return FONT_M;
+    case 'K': return FONT_K;
+    case 'T': return FONT_T;
     default: return NULL; /* space + unknown: blank advance */
     }
 }
@@ -474,6 +490,27 @@ static void draw_state(disp_state_t st)
         draw_text(54, "DANG NGHE");
         break;
     }
+    case ST_THINK: {
+        /* speech bubble with 1-3 dots (slow animation = "working") */
+        circle(64, 33, 17);
+        line(57, 48, 53, 52); /* bubble tail (short: no label overlap) */
+        line(57, 48, 60, 51);
+        int dots = 1 + (s_dot_phase % 3);
+        for (int i = 0; i < dots; i++) {
+            filled_circle(56 + i * 8, 33, 2);
+        }
+        draw_text(54, "DANG NGHI");
+        break;
+    }
+    case ST_OFFLINE: {
+        /* wifi arcs with a slash */
+        arc(64, 36, 10, 200, 340);
+        arc(64, 36, 17, 200, 340);
+        filled_circle(64, 42, 2);
+        line(50, 20, 78, 50);
+        draw_text(54, "MAT KET NOI");
+        break;
+    }
     case ST_IDLE:
     default:
         /* check in ring = ready */
@@ -522,11 +559,29 @@ static void disp_task(void *arg)
         if (!take_lock()) {
             continue; /* lock busy: skip slice, never exit */
         }
-        /* Lazy (re-)init when the bus never came up. */
+        /* Lazy (re-)init when the bus never came up. A stuck bus (no external
+         * pullups: a glitch leaves SDA low) needs the 9-clock rescue, not
+         * endless plain retries — otherwise the screen stays dark for the
+         * watchdog's full 90 s. */
         if (!s_hw_ok && (loop % DISP_RETRY_INIT_LOOPS) == 0) {
+            uint32_t up = now_ms() - s_boot_ms;
+            bool need_rescue = up > 10000;
+            xSemaphoreGive(s_lock);
+            if (need_rescue) {
+                ESP_LOGW(TAG, "panel still dark after %lus: bus rescue",
+                         (unsigned long)(up / 1000));
+                gpio_clock_rescue();
+                if (s_bus) {
+                    i2c_master_bus_reset(s_bus); /* best-effort */
+                }
+            }
+            if (!take_lock()) {
+                continue;
+            }
             bool ok = disp_hw_init();
             if (ok) {
                 mark_dirty_locked();
+                s_consec_err = 0;
                 ESP_LOGI(TAG, "hw (re-)init OK (50kHz, 0x4F)");
             }
             xSemaphoreGive(s_lock);
@@ -554,8 +609,13 @@ static void disp_task(void *arg)
             }
             continue;
         }
+        if (s_thinking && !s_speaking && s_hw_ok && !s_night && !s_panel_off
+            && (now_ms() - s_last_attempt_ms) > 900) {
+            s_dot_phase++;
+            mark_dirty_locked(); /* slow dots: "still working" */
+        }
         bool want = s_dirty && s_hw_ok && !s_night && !s_panel_off
-            && ((s_speaking ? ST_SPEAK : (s_listening ? ST_LISTEN : ST_IDLE)) != s_rendered
+            && (display_state_locked() != s_rendered
                 || !s_speaking);
         /* While speaking only state transitions repaint (bus quiet rule);
          * state flips always repaint so NGHE/NOI/NGHI stays truthful. */
@@ -565,7 +625,7 @@ static void disp_task(void *arg)
             continue;
         }
         /* Snapshot under lock, release before the slow I2C. */
-        disp_state_t st = s_speaking ? ST_SPEAK : (s_listening ? ST_LISTEN : ST_IDLE);
+        disp_state_t st = display_state_locked();
         bool wifi = s_wifi, sess = s_session;
         int vol = s_vol;
         xSemaphoreGive(s_lock);
@@ -661,6 +721,50 @@ void display_set_listening(bool listening)
         s_listening = listening;
         mark_dirty_locked();
         ESP_LOGI(TAG, "listening=%d", listening ? 1 : 0);
+    }
+    xSemaphoreGive(s_lock);
+}
+
+/* Priority: speaking > thinking > listening > offline > idle. */
+static disp_state_t display_state_locked(void)
+{
+    if (s_speaking) {
+        return ST_SPEAK;
+    }
+    if (s_thinking) {
+        return ST_THINK;
+    }
+    if (s_listening) {
+        return ST_LISTEN;
+    }
+    if (s_offline) {
+        return ST_OFFLINE;
+    }
+    return ST_IDLE;
+}
+
+void display_set_thinking(bool thinking)
+{
+    if (!take_lock()) {
+        return;
+    }
+    if (thinking != s_thinking) {
+        s_thinking = thinking;
+        mark_dirty_locked();
+        ESP_LOGI(TAG, "thinking=%d", thinking ? 1 : 0);
+    }
+    xSemaphoreGive(s_lock);
+}
+
+void display_set_offline(bool offline)
+{
+    if (!take_lock()) {
+        return;
+    }
+    if (offline != s_offline) {
+        s_offline = offline;
+        mark_dirty_locked();
+        ESP_LOGI(TAG, "offline=%d", offline ? 1 : 0);
     }
     xSemaphoreGive(s_lock);
 }

@@ -133,6 +133,7 @@ static bool s_closing;            /* window closed, waiting for the reply */
 static bool s_followup;           /* after a reply: listen for a follow-up */
 static TickType_t s_followup_until;
 static TickType_t s_last_tts_tick; /* last tts text/audio seen (reply end) */
+static bool s_reply_done;          /* tts stop seen for this turn */
 static TickType_t s_close_at;     /* when it is safe to drop the channel */
 #define VP_ARM_MS          5000u /* wait this long for the user to start */
 /* The wake word itself is still in the mic/VAD path right after WAKE.
@@ -279,6 +280,7 @@ static void vp_uplink_task(void *arg)
                     display_set_speaking(false);
                     s_speaking = false;
                 }
+                display_set_thinking(false);
                 ESP_LOGI(TAG, "no speech after wake: silent abort");
                 if (s_close_cb) {
                     s_close_cb();
@@ -315,6 +317,7 @@ static void vp_uplink_task(void *arg)
                         display_set_speaking(false);
                         s_speaking = false;
                     }
+                    display_set_thinking(false);
                     s_closing = false;
                     if (s_close_cb) {
                         s_close_cb();
@@ -322,11 +325,14 @@ static void vp_uplink_task(void *arg)
                     continue;
                 }
                 vp_send_listen_stop();
+                display_set_thinking(true); /* DANG NGHI until the answer */
                 /* Do NOT drop the channel yet: the server answers right after
                  * listen stop, and closing here cut the reply off (live-tested
                  * fast_speech: STT ok, 0 TTS). Wait for the answer to finish. */
                 s_closing = true;
-                s_close_at = now + pdMS_TO_TICKS(3000);
+                s_reply_done = false;
+                s_last_tts_tick = 0;
+                s_close_at = now + pdMS_TO_TICKS(15000);
                 ESP_LOGI(TAG, "window closed (vad silence %ums), awaiting reply",
                          (unsigned)VP_WINDOW_QUIET_MS);
             }
@@ -335,12 +341,9 @@ static void vp_uplink_task(void *arg)
         vp_set_screen_listen(s_armed || s_streaming || s_followup);
 
         if (s_closing) {
-            bool reply_done = !s_speaking
-                || (s_last_tts_tick != 0
-                    && (int32_t)(now - s_last_tts_tick) > (int32_t)pdMS_TO_TICKS(3000));
-            if (!reply_done) {
+            if (s_speaking) {
                 s_close_at = now + pdMS_TO_TICKS(1000); /* reply still playing */
-            } else if ((int32_t)(now - s_close_at) >= 0) {
+            } else if (s_reply_done || (int32_t)(now - s_close_at) >= 0) {
                 /* Multi-turn UX: keep the channel open for a follow-up so the
                  * user can answer WITHOUT saying "Alexa" again (real-user
                  * report). Close after the window, before the server's 10 s
@@ -351,6 +354,7 @@ static void vp_uplink_task(void *arg)
                     s_speaking = false;
                 }
                 s_followup = true;
+                display_set_thinking(false);
                 vp_pre_reset();
                 s_followup_until = now + pdMS_TO_TICKS(VP_FOLLOWUP_MS);
                 s_vad_seen = false;
@@ -510,6 +514,7 @@ void voice_path_on_ws_disconnected(void)
     if (s_speaking) {
         display_set_speaking(false); /* else the screen sticks on DANG NOI */
     }
+    display_set_thinking(false);
     s_speaking = false; /* never stay half-duplex-gated across sessions */
     s_armed = false;
     s_streaming = false; /* fresh WAKE required next session */
@@ -780,9 +785,19 @@ void voice_path_on_ws_text(const char *data, size_t len)
         } else {
             ESP_LOGI(TAG, "tts [%s]: %.120s", state, text ? text : "(no text)");
             if (strcmp(state, "start") == 0) {
-                display_set_speaking(true);
-                s_speaking = true;
+                /* Keep DANG NGHI: the server sends tts start before the audio
+                 * is ready. Speaking starts on the first sentence/audio. */
+                ESP_LOGI(TAG, "tts start (still thinking)");
+            } else if (strcmp(state, "sentence_start") == 0) {
+                display_set_thinking(false);
+                if (!s_speaking) {
+                    display_set_speaking(true);
+                    s_speaking = true;
+                }
             } else if (strcmp(state, "stop") == 0) {
+                s_reply_done = true;
+                s_close_at = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+                display_set_thinking(false);
                 display_set_speaking(false);
                 if (s_speaking && s_tx_gated > 0) {
                     ESP_LOGI(TAG, "tts stop: resumed uplink (%lu gated while speaking)",
@@ -842,6 +857,11 @@ void voice_path_on_ws_binary(const uint8_t *data, size_t len)
     /* NOTE: no barge-in yet — loud mic input while the speaker plays does
      * not abort. Mic VAD gates the window; server VAD owns segmentation. */
     s_last_tts_tick = xTaskGetTickCount();
+    if (!s_speaking) {
+        display_set_thinking(false);
+        display_set_speaking(true);
+        s_speaking = true;
+    }
     s_rx_frames++;
     if (len < s_rx_len_min) {
         s_rx_len_min = len;

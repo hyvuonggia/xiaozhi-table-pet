@@ -21,7 +21,9 @@
  *
  * Content (function-first pass, user decision 2026-10-25): NO expressive
  * eyes — the panel shows one of three STATES with icon + caps label:
- * SAN SANG (idle) / DANG NGHE (listening) / DANG NOI (speaking).
+ * SAN SANG (idle) / DANG NGHE (listening) / DANG NGHI (thinking) /
+ * DANG NOI (speaking) / MAT KET NOI (no WiFi).
+ * Priority: speaking > thinking > listening > offline > idle.
  * Status icon row (wifi/session/mic/vol), night sleep 01:00-07:00
  * server-local (caller calls display_set_night_sleep; we blank via 0xAE),
  * contrast 0x81 0x4F. State transitions always repaint (even mid-speech);
@@ -47,8 +49,15 @@ void display_init(void);
 /* Compatibility no-op (state screen ignores emotions). Logged only. */
 void display_set_emotion(const char *emotion);
 
-/* true = voice energy detected, uplink streaming. Drives DANG NGHE. */
+/* true = mic armed / user speaking. Drives DANG NGHE. */
 void display_set_listening(bool listening);
+
+/* true = speech sent, waiting for the assistant's answer. Drives DANG NGHI
+ * (slow dot animation). Cleared when TTS starts/stops. */
+void display_set_thinking(bool thinking);
+
+/* true = no WiFi. Drives MAT KET NOI (only when idle). */
+void display_set_offline(bool offline);
 
 /* Status row state. vol is clamped to 0..100. */
 void display_set_status(bool wifi, bool session, int vol);
