@@ -43,6 +43,19 @@ bool wakeword_consume(void);
 /* Tick of the most recent detection, or 0 if none yet. */
 TickType_t wakeword_last_wake_tick(void);
 
+/* Neural VAD (vadnet1_medium, same 16 kHz feed): discriminates real speech
+ * from room music/TV noise. Energy/RMS alone cannot — music trips it.
+ * voice_path.c confirms streaming ONLY on VAD speech, never on energy.
+ *
+ * Init is fail-closed (loud log, never panic): if the model is missing,
+ * wakeword_vad_ready() stays false and the window never opens on speech.
+ * All accessors are cheap, non-blocking, and safe from any task. */
+bool wakeword_vad_ready(void);            /* model loaded + detecting */
+uint32_t wakeword_vad_streak(void);       /* consecutive VAD_SPEECH frames */
+TickType_t wakeword_vad_last_speech_tick(void); /* last VAD_SPEECH tick, 0 = none */
+bool wakeword_vad_speech_now(void);       /* most recent VAD frame was speech */
+void wakeword_vad_reset(void);            /* clear streak/state (call on wake) */
+
 #ifdef __cplusplus
 }
 #endif

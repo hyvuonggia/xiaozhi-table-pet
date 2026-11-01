@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "esp_attr.h"
@@ -96,12 +97,13 @@ static void wd_check_heartbeat(TickType_t now)
     }
 }
 
+static RTC_NOINIT_ATTR uint32_t s_mic_reboot_streak;
+
 static void wd_check_mic(TickType_t now)
 {
-    if (!voice_path_is_listening()) {
-        s_mic_listen_since = 0;
-        return; /* SPEC: only while a session is active */
-    }
+    /* Mic health matters even while idle: with wake-word gating a dead mic
+     * means the robot can never hear "Alexa" again. The audio channel is
+     * closed between conversations, so do NOT gate this on the session. */
     TickType_t last = audio_in_last_ok_tick();
     if (last == 0) {
         /* Never succeeded: DMA starves from boot (loose mic clock/data).
@@ -113,13 +115,33 @@ static void wd_check_mic(TickType_t now)
             return;
         }
         if (wd_stale(now, s_mic_listen_since, 90000)) {
-            wd_reboot(WD_REASON_MIC, "mic never delivered in 90 s of session");
+            /* Hardware-dead mic: reboot loops would be worse than running
+             * degraded, so warn periodically instead of restarting. */
+            static TickType_t s_warn;
+            if (s_warn == 0 || wd_stale(now, s_warn, 60000)) {
+                s_warn = now;
+                ESP_LOGE(TAG, "mic never delivered a frame (check INMP441 "
+                              "wiring); running deaf, not rebooting");
+            }
         }
         return;
     }
     s_mic_listen_since = 0;
     if (wd_stale(now, last, WD_MIC_MS)) {
-        wd_reboot(WD_REASON_MIC, "mic >25 s without successful read in session");
+        if (s_mic_reboot_streak < 3) {
+            s_mic_reboot_streak++;
+            wd_reboot(WD_REASON_MIC, "mic >25 s without successful read");
+        } else {
+            static TickType_t s_warn2;
+            if (s_warn2 == 0 || wd_stale(now, s_warn2, 60000)) {
+                s_warn2 = now;
+                ESP_LOGE(TAG, "mic stale >25 s (3 reboots already tried); "
+                              "continuing without reboot");
+            }
+        }
+    } else if (s_mic_reboot_streak != 0
+               && !wd_stale(now, last, 300000)) {
+        s_mic_reboot_streak = 0; /* 5 min healthy: forgive */
     }
 }
 
@@ -251,8 +273,8 @@ void watchdog_init(void)
         ESP_LOGI(TAG, "already init");
         return;
     }
-    if (xTaskCreate(watchdog_task, "watchdog", WD_STACK, NULL,
-                    WD_PRIO, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(watchdog_task, "watchdog", WD_STACK, NULL,
+                        WD_PRIO, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "supervisor task OOM (running without watchdog)");
         return;
     }

@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "buttons";
@@ -160,7 +161,7 @@ void buttons_init(void)
     }
     ESP_LOGI(TAG, "init OK: BOOT=GPIO0 VOL+=GPIO40 VOL-=GPIO39, volume=%d",
              s_volume);
-    if (xTaskCreate(buttons_poll_task, "buttons", 2048, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(buttons_poll_task, "buttons", 2048, NULL, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "poll task create failed");
         return;
     }

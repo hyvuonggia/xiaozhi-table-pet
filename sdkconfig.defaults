@@ -21,3 +21,15 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # WAKE lane: pack the wn9_alexa model into build/srmodels/srmodels.bin
 # (flashed to the "model" partition) for the "Alexa" wake phrase.
 CONFIG_SR_WN_WN9_ALEXA=y
+# VOICE-GATE lane: neural VAD (vadnet1_medium) discriminates speech from
+# room music/TV noise. Energy alone (RMS floor) cannot — music trips it,
+# the server ASR hallucinates, and the user hears nonsense replies.
+# Symbol verified against managed_components/espressif__esp-sr/Kconfig.projbuild
+# (choice SR_VADN_MODEL_LOAD; movemodel.py packs 'vadnet1_medium' on this).
+CONFIG_SR_VADN_VADNET1_MEDIUM=y
+
+# Internal DRAM ran out (int free 1.8-3.3 KB with WakeNet+VADNet+audio):
+# WS writes then failed with transport_poll_write(0) and tasks OOM'd.
+# Let WiFi/lwIP buffers and non-audio task stacks live in PSRAM.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y

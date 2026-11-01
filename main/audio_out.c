@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/task.h"
@@ -178,6 +179,7 @@ static void spk_task(void *arg)
                        && uxQueueMessagesWaiting(s_q) < 5
                        && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(500)) {
                     write_silence_ms(20);
+                    vTaskDelay(pdMS_TO_TICKS(20)); /* realtime pacing */
                 }
             }
             write_silence_ms(60);
@@ -332,9 +334,19 @@ void audio_out_start(void)
     }
 
     /* Opus decoder needs a large stack (same family as the encoder). */
-    if (tx && s_q && xTaskCreate(spk_task, "spk", 24576, NULL, 5, &s_task) != pdPASS) {
-        ESP_LOGE(TAG, "speaker task create failed");
+    /* 24 KB stack in internal RAM starved the rest of the firmware (int free
+     * fell to ~1.3 KB, WS writes failed, other tasks OOM'd). The speaker task
+     * only decodes + writes DMA, so a PSRAM stack is fine here; the mic task
+     * (realtime) stays internal. */
+    if (tx && s_q && xTaskCreateWithCaps(spk_task, "spk", 24576, NULL, 5,
+                                         &s_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+        /* No feeder task -> DMA underruns repeat the last buffer forever:
+         * that is the loud continuous drone. Silence the amp instead. */
+        ESP_LOGE(TAG, "speaker task create failed -> disabling I2S TX");
         s_task = NULL;
+        i2s_channel_disable(tx);
+        i2s_del_channel(tx);
+        s_tx = NULL;
     }
     ESP_LOGI(TAG, "audio_out started (tx=%s dec=%s vol=%d)",
              tx ? "ok" : "DOWN", s_dec ? "ok" : "DOWN", s_volume);

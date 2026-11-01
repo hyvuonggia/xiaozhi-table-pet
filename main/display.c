@@ -9,6 +9,7 @@
 #include <strings.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
@@ -633,8 +634,8 @@ void display_init(void)
         xSemaphoreGive(s_lock);
     }
     s_inited = true;
-    if (xTaskCreate(disp_task, "display", DISP_TASK_STACK,
-                    NULL, DISP_TASK_PRIO, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(disp_task, "display", DISP_TASK_STACK,
+                        NULL, DISP_TASK_PRIO, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "task create failed (setters still safe)");
         return;
     }

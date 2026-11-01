@@ -38,9 +38,16 @@
 extern "C" {
 #endif
 
-/* Idempotent. Stores WS handle, spawns uplink task (prio 4). The task
- * stays idle until a session is established (hello with session_id). */
-void voice_path_start(esp_websocket_client_handle_t ws);
+/* Idempotent. Stores WS handle + channel callbacks, spawns uplink task
+ * (prio 4). open_cb() is called on a wake word (channel opens only for the
+ * conversation), close_cb() when the window closes (no idle server session,
+ * so the server never speaks its goodbye). */
+/* Update the WS handle when the audio channel is recreated per conversation.
+ * NULL = channel gone (session/streaming state is cleared). */
+void voice_path_set_ws(esp_websocket_client_handle_t ws);
+
+void voice_path_start(esp_websocket_client_handle_t ws,
+                      void (*open_cb)(void), void (*close_cb)(void));
 
 /* Lifecycle hooks from the WS event handler (narrow routing in main.c). */
 void voice_path_on_ws_connected(void);

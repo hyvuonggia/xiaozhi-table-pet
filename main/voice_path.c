@@ -6,8 +6,10 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "cJSON.h"
@@ -36,6 +38,8 @@ static const char *TAG = "voice";
     "{\"type\":\"listen\",\"state\":\"stop\",\"mode\":\"auto\"}"
 
 static esp_websocket_client_handle_t s_ws;
+static void (*s_open_cb)(void);  /* main.c: open audio channel on wake */
+static void (*s_close_cb)(void); /* main.c: drop audio channel when idle */
 static bool s_task_on;
 static bool s_session;    /* hello with session_id seen */
 static bool s_listening;  /* listen start sent for this session */
@@ -97,96 +101,242 @@ static void vp_send_listen_stop(void)
     }
 }
 
-/* Wake-word conversation window (WAKE lane, replaces energy auto-open).
- * No WakeNet trigger -> no uplink: room noise can never open the stream.
- * Window OPENS on wakeword_consume() ("WAKE -> window open"), stays open
- * while mic RMS > floor*3+800 (speech continuing), and CLOSES after
- * 1500 ms below that line ("window closed"). Server VAD still segments
- * inside the window. Quiet room -> IDLE screen, nothing sent.
- * TTS playing -> SPEAKING screen, uplink paused (half-duplex echo guard). */
-static uint32_t s_floor;          /* adaptive noise floor (RMS units) */
-static bool s_window;             /* conversation window open (wake latched) */
-static TickType_t s_quiet_since;  /* last tick with RMS above keep threshold */
-static TickType_t s_window_open_tick; /* wake moment (minimum window guard) */
+/* Wake-word conversation window (WAKE lane, neural-VAD gated).
+ *
+ * Two-stage design (live-tested edge cases 2026-10-31):
+ *  1. WAKE arms the window locally (screen: DANG NGHE) but sends NOTHING.
+ *     If the user stays silent for VP_ARM_MS the window disarms silently:
+ *     no listen start/stop, so the server never hears an empty utterance and
+ *     never says goodbye ("tạm biệt sếp") after a bare "Alexa".
+ *  2. The first real SPEECH — VADNet neural VAD streak, never raw energy —
+ *     sends listen{start} and streams. The window then stays open while
+ *     VAD reports speech, and through TTS playback (echo of our own speaker
+ *     must NOT hold it open forever), closing VP_WINDOW_QUIET_MS after the
+ *     last speech/answer.
+ *
+ * Energy alone can NEVER open or extend the stream: in a noisy room
+ * (TV/music, ambient RMS 2000-3500) music trips any RMS threshold, the
+ * server ASR hallucinates ("đây"), and the user hears nonsense. VADNet was
+ * trained to separate speech from music — only its SPEECH streak counts. */
+static bool s_armed;              /* wake seen, waiting for first speech */
+static bool s_streaming;          /* listen start sent, uplink live */
+static TickType_t s_arm_tick;     /* wake moment */
+static TickType_t s_quiet_since;  /* last tick with real (non-echo) speech */
+static TickType_t s_window_open_tick;
 static bool s_screen_listen;      /* last display_set_listening() value */
-#define VP_KEEP_MUL 3u
-#define VP_KEEP_ADD 800u
-/* Inside an open window the wake word already proved the user is talking, so
- * be MORE sensitive (the laptop/TV can be quiet while the user speaks). */
-#define VP_INWIN_MUL 2u
-#define VP_INWIN_ADD 500u
+static bool s_vad_unready_warned; /* throttled "VAD missing" log */
+static bool s_listen_sent;        /* listen start sent for this window */
+static bool s_vad_seen;           /* VAD confirmed real speech this window */
+static bool s_closing;            /* window closed, waiting for the reply */
+static TickType_t s_close_at;     /* when it is safe to drop the channel */
+#define VP_ARM_MS          5000u /* wait this long for the user to start */
+/* The wake word itself is still in the mic/VAD path right after WAKE.
+ * Ignore that tail, then require neural-VAD speech (not room noise) to
+ * confirm the user is actually talking. */
+#define VP_ARM_IGNORE_MS    500u
+/* VADNet frames are ~30 ms: 3 consecutive SPEECH frames (~90 ms) confirm.
+ * Isolated music blips never streak; real speech always does. */
+#define VP_VAD_CONFIRM_FRAMES 2u
+/* While streaming, VAD speech within the last 500 ms counts as activity;
+ * longer gaps let the 2 s quiet timer below run out and close the window. */
+#define VP_VAD_HOLD_MS      500u
 #define VP_WINDOW_QUIET_MS 2000u /* server VAD needs the stream through the
-                                    end of the sentence; 1.5 s cut it off */
-#define VP_WINDOW_MIN_MS   6000u /* user needs time to start talking */
-#define VP_FLOOR_SLOW_DIV  64u
+                                     end of the sentence */
+#define VP_WINDOW_MIN_MS   6000u /* short utterances are not cut off */
 
-/* Uplink: drain audio_in_pop_opus() -> WS BINARY while session active
- * AND listening. Never blocks the mic task (pop has a short timeout);
- * WS congestion drops the frame and counts it. */
+/* Pre-stream audio ring: while the window is armed we keep the newest opus
+ * frames (PSRAM) so words spoken right after "Alexa" are sent once streaming
+ * starts. VADNet confirmation can take a second; without this the first half
+ * of a fast question was lost. */
+#define VP_PRE_N 100 /* 100 x 60 ms = 6 s (PSRAM) */
+static uint8_t *s_pre_buf;
+static uint16_t *s_pre_len;
+static int s_pre_head, s_pre_count;
+
+static void vp_pre_reset(void)
+{
+    s_pre_head = 0;
+    s_pre_count = 0;
+}
+
+static void vp_pre_push(const uint8_t *data, size_t len)
+{
+    if (!s_pre_buf || !s_pre_len || len == 0 || len > VP_OPUS_BUF) {
+        return;
+    }
+    int idx = (s_pre_head + s_pre_count) % VP_PRE_N;
+    memcpy(s_pre_buf + (size_t)idx * VP_OPUS_BUF, data, len);
+    s_pre_len[idx] = (uint16_t)len;
+    if (s_pre_count < VP_PRE_N) {
+        s_pre_count++;
+    } else {
+        s_pre_head = (s_pre_head + 1) % VP_PRE_N;
+    }
+}
+
+static void vp_pre_flush(void)
+{
+    if (!s_pre_buf || !s_ws) {
+        vp_pre_reset();
+        return;
+    }
+    for (int i = 0; i < s_pre_count; i++) {
+        int idx = (s_pre_head + i) % VP_PRE_N;
+        if (s_pre_len[idx] == 0) {
+            continue;
+        }
+        if (esp_websocket_client_send_bin(s_ws,
+                (const char *)(s_pre_buf + (size_t)idx * VP_OPUS_BUF),
+                s_pre_len[idx], pdMS_TO_TICKS(VP_SEND_TIMEOUT_MS)) >= 0) {
+            s_tx_frames++;
+        } else {
+            s_tx_drop++;
+        }
+        /* Pace the catch-up burst: the server closes the socket on a
+         * multi-second flood (transport_poll_write(0), seen live). */
+        vTaskDelay(pdMS_TO_TICKS(12));
+    }
+    ESP_LOGI(TAG, "pre-stream flush: %d frames (%.1f s)",
+             s_pre_count, s_pre_count * 0.06);
+    vp_pre_reset();
+}
+
+static void vp_set_screen_listen(bool on)
+{
+    if (on != s_screen_listen) {
+        s_screen_listen = on;
+        display_set_listening(on);
+    }
+}
+
+/* Uplink: drain audio_in_pop_opus() -> WS BINARY. Never blocks the mic task
+ * (pop has a short timeout); WS congestion drops the frame and counts it. */
 static void vp_uplink_task(void *arg)
 {
     (void)arg;
     uint8_t buf[VP_OPUS_BUF];
     ESP_LOGI(TAG, "uplink task on (prio %d)", VP_UPLINK_PRIO);
     while (1) {
-        if (!s_session) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        if (!s_ws) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        /* Adaptive floor: drops fast to quieter rooms, rises slowly. */
-        uint32_t rms = audio_in_recent_rms();
-        if (s_floor == 0) {
-            s_floor = rms;
-        } else if (rms < s_floor) {
-            s_floor = rms; /* quieter: floor drops fast */
-        } else {
-            s_floor += (rms - s_floor) / VP_FLOOR_SLOW_DIV; /* rises slowly */
-        }
-        uint32_t keep = s_floor * VP_INWIN_MUL + VP_INWIN_ADD;
+        /* Wake detection must run even while the audio channel is CLOSED
+         * (channel opens on wake), so this check comes before the session
+         * guard. Missing it made "Alexa" dead until a session existed. */
+        uint32_t rms = audio_in_recent_rms(); /* log-only; gating is VAD */
         TickType_t now = xTaskGetTickCount();
-        /* Window opens ONLY on a WakeNet trigger — never on energy. */
+
+        /* Stage 1: wake arms the window locally (no protocol traffic). */
         if (wakeword_consume()) {
-            if (!s_window) {
-                ESP_LOGI(TAG, "WAKE -> window open (rms=%lu floor=%lu)",
-                         (unsigned long)rms, (unsigned long)s_floor);
+            if (s_speaking) {
+                /* Barge-in not supported: ignore wake while the robot talks. */
+                ESP_LOGI(TAG, "WAKE ignored (robot is speaking)");
+            } else {
+                /* Stream IMMEDIATELY from the wake word: this is what keeps a
+                 * fast "Alexa, mấy giờ rồi" intact. VAD is used to decide when
+                 * to close / whether any real speech happened, never as a
+                 * gate that would clip the first words (a catch-up burst made
+                 * the server drop the socket: transport_poll_write(0)). */
+                s_armed = true;
+                s_streaming = true;
+                s_closing = false;
+                s_listen_sent = false;
+                s_vad_seen = false;
+                s_arm_tick = now;
+                s_quiet_since = now;
+                s_window_open_tick = now;
+                wakeword_vad_reset(); /* confirm streak starts AFTER wake */
+                ESP_LOGI(TAG, "WAKE -> streaming (rms=%lu vad=%d)",
+                         (unsigned long)rms,
+                         wakeword_vad_ready() ? 1 : 0);
+                if (s_open_cb) {
+                    s_open_cb(); /* audio channel exists only during talk */
+                }
             }
-            s_window = true;
-            s_window_open_tick = now;
-            s_quiet_since = now;
-            vp_send_listen_start(); /* explicit: server starts segmenting now */
-        } else if (s_window) {
-            if (rms > keep) {
-                s_quiet_since = now; /* speech continues: hold window */
-            } else if ((now - s_window_open_tick) >= pdMS_TO_TICKS(VP_WINDOW_MIN_MS)
-                       && (now - s_quiet_since) >= pdMS_TO_TICKS(VP_WINDOW_QUIET_MS)) {
-                s_window = false;
+        }
+
+        if (s_streaming) {
+            if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
+                s_vad_seen = true;
+            }
+            /* No real speech after wake: abort silently. Closing the socket
+             * (instead of listen stop) means the server cannot deliver its
+             * "tạm biệt sếp" end_prompt. */
+            if (!s_vad_seen
+                && (int32_t)(now - s_arm_tick) > (int32_t)pdMS_TO_TICKS(VP_ARM_MS)) {
+                s_streaming = false;
+                s_armed = false;
+                vp_set_screen_listen(false);
+                ESP_LOGI(TAG, "no speech after wake: silent abort");
+                if (s_close_cb) {
+                    s_close_cb();
+                }
+                continue;
+            }
+            if (!wakeword_vad_ready() && !s_vad_unready_warned) {
+                s_vad_unready_warned = true;
+                ESP_LOGW(TAG, "VAD model missing — window cannot confirm speech");
+            }
+        }
+        if (s_streaming) {
+            if (s_speaking) {
+                /* Our own speaker is audible to the mic: never let the echo
+                 * extend the window, but keep it open for the reply. */
+                s_quiet_since = now;
+            } else if (wakeword_vad_speech_now()
+                       || (int32_t)(now - wakeword_vad_last_speech_tick())
+                          < (int32_t)pdMS_TO_TICKS(VP_VAD_HOLD_MS)) {
+                /* Neural speech holds the window; music/TV silence lets the
+                 * quiet timer below run out and close it. */
+                s_quiet_since = now;
+            } else if ((int32_t)(now - s_window_open_tick) >= (int32_t)pdMS_TO_TICKS(VP_WINDOW_MIN_MS)
+                       && (int32_t)(now - s_quiet_since) >= (int32_t)pdMS_TO_TICKS(VP_WINDOW_QUIET_MS)) {
+                s_streaming = false;
+                s_armed = false;
                 vp_send_listen_stop();
-                ESP_LOGI(TAG, "window closed (rms=%lu floor=%lu quiet %ums)",
-                         (unsigned long)rms, (unsigned long)s_floor,
+                /* Do NOT drop the channel yet: the server answers right after
+                 * listen stop, and closing here cut the reply off (live-tested
+                 * fast_speech: STT ok, 0 TTS). Wait for the answer to finish. */
+                s_closing = true;
+                s_close_at = now + pdMS_TO_TICKS(3000);
+                ESP_LOGI(TAG, "window closed (vad silence %ums), awaiting reply",
                          (unsigned)VP_WINDOW_QUIET_MS);
             }
         }
-        if (s_window != s_screen_listen) {
-            s_screen_listen = s_window;
-            display_set_listening(s_window);
+
+        vp_set_screen_listen(s_armed || s_streaming);
+
+        if (s_closing) {
+            if (s_speaking) {
+                s_close_at = now + pdMS_TO_TICKS(3000); /* reply still playing */
+            } else if ((int32_t)(now - s_close_at) >= 0) {
+                s_closing = false;
+                if (s_close_cb) {
+                    s_close_cb(); /* idle now: no server goodbye */
+                }
+                ESP_LOGI(TAG, "channel closed after reply");
+            }
         }
+
+        /* Do NOT drain the mic queue while we are not sending: the queue
+         * keeps the newest ~480 ms, so when streaming starts the words said
+         * immediately after "Alexa" are still there (fast speech no longer
+         * loses its first half). */
+        if (!s_streaming || s_speaking || !s_session || !s_ws) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (!s_listen_sent) {
+            vp_send_listen_start(); /* session is live now */
+            s_listen_sent = s_listening;
+        }
+        if ((int32_t)(now - s_arm_tick) < (int32_t)pdMS_TO_TICKS(VP_ARM_IGNORE_MS)) {
+            /* Do not send the wake word itself: the server would transcribe
+             * "Alexa" and answer it ("Chào sếp..."). Keep the queue fresh. */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
         int n = audio_in_pop_opus(buf, sizeof(buf), VP_POP_TIMEOUT_MS);
         if (n <= 0) {
             continue; /* timeout/empty/not-running: no frame, no send */
-        }
-        if (s_speaking) {
-            /* Half-duplex: pop-and-drop so the mic queue stays fresh. */
-            s_tx_gated++;
-            continue;
-        }
-        if (!s_window) {
-            /* Outside the wake window: pop-and-drop. Nothing sent. */
-            s_tx_gated++;
-            continue;
         }
         int rc = esp_websocket_client_send_bin(s_ws, (const char *)buf, n,
                                                pdMS_TO_TICKS(VP_SEND_TIMEOUT_MS));
@@ -206,15 +356,44 @@ static void vp_uplink_task(void *arg)
     }
 }
 
-void voice_path_start(esp_websocket_client_handle_t ws)
+void voice_path_set_ws(esp_websocket_client_handle_t ws)
 {
     s_ws = ws;
+    if (!ws) {
+        /* Only the handle/session die here. Do NOT clear armed/streaming:
+         * ws_open_for_wake() is called from inside the wake branch, and
+         * wiping the state there made the whole window a no-op. */
+        s_session = false;
+        s_listen_sent = false;
+    }
+}
+
+void voice_path_start(esp_websocket_client_handle_t ws,
+                      void (*open_cb)(void), void (*close_cb)(void))
+{
+    s_ws = ws;
+    s_open_cb = open_cb;
+    s_close_cb = close_cb;
+    if (!s_pre_buf) {
+        s_pre_buf = heap_caps_malloc((size_t)VP_PRE_N * VP_OPUS_BUF,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_pre_len = calloc(VP_PRE_N, sizeof(uint16_t));
+        if (!s_pre_buf || !s_pre_len) {
+            ESP_LOGW(TAG, "pre-stream ring unavailable (first word may clip)");
+            free(s_pre_buf);
+            free(s_pre_len);
+            s_pre_buf = NULL;
+            s_pre_len = NULL;
+        } else {
+            ESP_LOGI(TAG, "pre-stream ring %d frames (PSRAM)", VP_PRE_N);
+        }
+    }
     wakeword_init(); /* idempotent; soft-fails to "no wake" if PSRAM/model bad */
     if (s_task_on) {
         return;
     }
-    if (xTaskCreate(vp_uplink_task, "vp_up", VP_UPLINK_STACK,
-                    NULL, VP_UPLINK_PRIO, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(vp_uplink_task, "vp_up", VP_UPLINK_STACK,
+                        NULL, VP_UPLINK_PRIO, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "uplink task OOM (downlink still live)");
         return;
     }
@@ -233,8 +412,10 @@ void voice_path_on_ws_disconnected(void)
     s_session = false;
     s_listening = false;
     s_speaking = false; /* never stay half-duplex-gated across sessions */
-    s_window = false; /* wake window needs a fresh WAKE next session */
-    s_floor = 0; /* re-learn the room on next session */
+    s_armed = false;
+    s_streaming = false; /* fresh WAKE required next session */
+    s_closing = false;
+    s_vad_unready_warned = false;
     if (s_screen_listen) {
         s_screen_listen = false;
         display_set_listening(false);
@@ -557,9 +738,8 @@ void voice_path_on_ws_binary(const uint8_t *data, size_t len)
     if (!data || len == 0) {
         return;
     }
-    /* NOTE (P3): no barge-in yet — no VAD, so loud mic input while the
-     * speaker plays does not abort. Mic keeps streaming; server VAD owns
-     * segmentation. */
+    /* NOTE: no barge-in yet — loud mic input while the speaker plays does
+     * not abort. Mic VAD gates the window; server VAD owns segmentation. */
     s_rx_frames++;
     if (len < s_rx_len_min) {
         s_rx_len_min = len;

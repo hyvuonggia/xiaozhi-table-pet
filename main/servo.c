@@ -5,6 +5,7 @@
 #include "driver/ledc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
@@ -208,7 +209,7 @@ void servo_init(void)
     ESP_LOGI(TAG, "init OK: GPIO%d ch0 H + GPIO%d ch1 V, 50Hz 500-2500us",
              SERVO_GPIO_H, SERVO_GPIO_V);
     servo_center();
-    if (xTaskCreate(servo_demo_task, "servo_demo", 3072, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(servo_demo_task, "servo_demo", 3072, NULL, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGW(TAG, "demo task create failed (servo still usable)");
     }
 }

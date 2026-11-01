@@ -36,6 +36,7 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -93,7 +94,6 @@ static esp_websocket_client_handle_t s_ws;
 static char s_ws_url[256];
 static char s_ota_token[128]; /* Bearer token from OTA response, empty if none */
 static bool s_got_session_id;
-static volatile bool s_ws_reconnect_run;
 
 /* ---------- small helpers ---------- */
 
@@ -603,6 +603,50 @@ static void ota_fetch_blocking(const char *ota_url)
 
 /* ---------- WebSocket: hello -> session_id + heartbeat ---------- */
 
+/* Old-firmware architecture (verified in hyvuonggia/xiaozhi-deskemoji-taibai:
+ * OpenAudioChannel on conversation start, CloseAudioChannel on leave): the
+ * audio channel exists ONLY during a conversation. Keeping it open while idle
+ * makes the server run its 10 s no-voice timeout and speak the end_prompt
+ * goodbye ("tạm biệt sếp") for no reason. So: open on wake, close when the
+ * conversation window closes. */
+static volatile bool s_ws_intentional_close;
+
+/* Audio-channel lifecycle used by the voice path (wake opens, idle closes).
+ * The voice path only flips a request flag: creating/destroying the client
+ * from the audio task deadlocked the device (live-tested 2026-10-31). A small
+ * control task owns the real lifecycle. */
+void ws_open_for_wake(void);
+void ws_close_idle(void);
+static void ws_client_create(void);
+static volatile bool s_ws_want_open;
+static bool s_ws_ctl_on;
+
+static void ws_control_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        if (s_ws_want_open && !s_ws) {
+            s_ws_intentional_close = false;
+            s_got_session_id = false;
+            ws_client_create(); /* lazy: no idle client eating internal RAM */
+            if (s_ws) {
+                esp_err_t err = esp_websocket_client_start(s_ws);
+                ESP_LOGI(TAG, "ws open (wake): %s", esp_err_to_name(err));
+            }
+        } else if (!s_ws_want_open && s_ws) {
+            esp_websocket_client_handle_t h = s_ws;
+            s_ws = NULL;
+            s_ws_intentional_close = true;
+            s_got_session_id = false;
+            voice_path_set_ws(NULL);
+            (void)esp_websocket_client_stop(h);
+            (void)esp_websocket_client_destroy(h);
+            ESP_LOGI(TAG, "ws close (idle, client destroyed)");
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 static void send_hello(void)
 {
     if (!s_ws) {
@@ -617,45 +661,31 @@ static void send_hello(void)
     }
 }
 
-/* Explicit reconnect: driver auto-reconnect is not relied upon.
- * Runs in its own task (stop/start may block), retries one cycle;
- * further DISCONNECTED events schedule the next cycle. Never panics. */
-static void ws_reconnect_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    s_ws_reconnect_run = false;
-    if (s_ws) {
-        ESP_LOGI(TAG, "ws reconnect attempt");
-        (void)esp_websocket_client_stop(s_ws); /* best-effort cleanup */
-        esp_err_t err = esp_websocket_client_start(s_ws);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "ws restart: %s (next disconnect reschedules)",
-                     esp_err_to_name(err));
-        }
-    }
-    vTaskDelete(NULL);
-}
-
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg;
     (void)base;
+    /* arg is the client handle this handler was registered for. A client
+     * destroyed at the end of a conversation can still emit a late
+     * DISCONNECTED/ERROR; ignoring stale handles stops that ghost event from
+     * tearing down the NEW session (it did: voice went silent ~1 s in). */
+    if (arg != (void *)s_ws) {
+        return;
+    }
     esp_websocket_event_data_t *ev = data;
     if (id == WEBSOCKET_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "ws connected");
         send_hello();
         voice_path_on_ws_connected();
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
-        ESP_LOGW(TAG, "ws disconnected, scheduling reconnect in 5s");
-        voice_path_on_ws_disconnected(); /* P2b: stop streaming, re-listen on hello */
-        if (!s_ws_reconnect_run) {
-            s_ws_reconnect_run = true;
-            if (xTaskCreate(ws_reconnect_task, "ws_reconn", 3072, NULL, 3, NULL) != pdPASS) {
-                s_ws_reconnect_run = false;
-                ESP_LOGW(TAG, "ws reconnect task OOM, will retry on next event");
-            }
+        voice_path_on_ws_disconnected(); /* stop streaming; fresh WAKE next time */
+        if (s_ws_intentional_close) {
+            ESP_LOGI(TAG, "ws closed (idle, no reconnect until next wake)");
+            return;
         }
+        /* Driver auto-reconnect (reconnect_timeout_ms=10 s) handles this;
+         * a second hand-rolled task used to OOM on internal RAM and shadow
+         * the driver's own retry. */
+        ESP_LOGW(TAG, "ws disconnected (driver will retry)");
     } else if (id == WEBSOCKET_EVENT_DATA && ev && ev->data_ptr && ev->data_len > 0) {
         /* P2b voice path: binary opus -> speaker, text control -> dispatch.
          * F7 note (left as-is, low-risk deferral): the text frame is parsed
@@ -696,7 +726,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
-static void ws_start(void)
+static void ws_client_create(void)
 {
     esp_websocket_client_config_t cc = {
         .uri = s_ws_url[0] ? s_ws_url : WS_URL_FALLBACK,
@@ -730,13 +760,25 @@ static void ws_start(void)
     if (esp_websocket_client_append_header(s_ws, "Client-Id", client_id) != ESP_OK) {
         ESP_LOGW(TAG, "ws header Client-Id not set");
     }
-    if (esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL) != ESP_OK) {
+    if (esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, s_ws) != ESP_OK) {
         ESP_LOGE(TAG, "ws event register failed");
     }
-    if (esp_websocket_client_start(s_ws) != ESP_OK) {
-        ESP_LOGE(TAG, "ws start failed (auto-reconnect continues in driver)");
-    }
-    voice_path_start(s_ws); /* P2b: opus uplink task (idles until session) */
+    /* Do NOT start here: the channel opens on the first wake word (see
+     * ws_open_for_wake) so an idle robot never triggers the server goodbye. */
+    voice_path_set_ws(s_ws); /* handle changes per conversation */
+}
+
+/* Called by the voice path on a wake word: open the audio channel. */
+void ws_open_for_wake(void)
+{
+    s_ws_want_open = true; /* the control task does the real work */
+}
+
+/* Called when the conversation window closes: drop the audio channel so the
+ * server has no idle session to farewell. */
+void ws_close_idle(void)
+{
+    s_ws_want_open = false; /* the control task does the real work */
 }
 
 /* ---------- app_main ---------- */
@@ -789,6 +831,10 @@ void app_main(void)
     }
 
     wifi_sta_start(ssid, pass ? pass : "");
+    /* Modem sleep stalls WS writes (seen as transport_poll_write(0) right
+     * after streaming starts). Latency + stability matter more than mA here. */
+    esp_err_t ps = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "wifi ps none: %s", esp_err_to_name(ps));
     free(ssid);
     free(pass);
 
@@ -801,7 +847,10 @@ void app_main(void)
     ota_fetch_blocking(ota_url ? ota_url : OTA_URL_FALLBACK);
     free(ota_url);
 
-    ws_start();
+    voice_path_start(NULL, ws_open_for_wake, ws_close_idle);
+    if (xTaskCreate(ws_control_task, "ws_ctl", 4096, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "ws control task OOM (voice channel unavailable)");
+    }
 
     /* P2 structure: audio + servo + buttons. Each module owns its task(s);
      * see lock-contract note at top of file. All soft-fail, never panic.
@@ -838,8 +887,10 @@ void app_main(void)
         ESP_LOGI(TAG, "heartbeat up=%lus wifi=%d session=%d",
                  (unsigned long)up, wifi ? 1 : 0,
                  s_got_session_id ? 1 : 0);
-        ESP_LOGI(TAG, "mem free=%lu min-ever=%lu",
+        ESP_LOGI(TAG, "mem free=%lu min-ever=%lu int=%lu int-min=%lu",
                  (unsigned long)esp_get_free_heap_size(),
-                 (unsigned long)esp_get_minimum_free_heap_size());
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     }
 }

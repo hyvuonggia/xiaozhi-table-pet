@@ -510,11 +510,11 @@ static void selftest_task(void *arg)
              (unsigned long)rms_peak, (unsigned long)last,
              last ? "YES (hearing)" : "NONE (check mic wiring)");
 
+    /* No boot beep: the user hears any tone as an annoying "tít tít" and the
+     * speaker path is already proven by the TTS replies. Log-only check. */
     uint32_t u0 = audio_out_underruns();
-    audio_out_tone(440, 500);
-    uint32_t u1 = audio_out_underruns();
-    ESP_LOGI(TAG, "selftest speaker: 440Hz 0.5s played, underruns %lu->%lu",
-             (unsigned long)u0, (unsigned long)u1);
+    ESP_LOGI(TAG, "selftest speaker: tone disabled (log-only), underruns=%lu",
+             (unsigned long)u0);
 
     uint32_t f, b, lb;
     audio_in_opus_stats(&f, &b, &lb);
@@ -534,7 +534,7 @@ void audio_selftest(void)
     }
     s_selftest_live = true;
     /* 8 KB: audio_out_tone + i2s driver call chain need headroom. */
-    if (xTaskCreate(selftest_task, "aud_self", 8192, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(selftest_task, "aud_self", 8192, NULL, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "selftest task create failed (continuing)");
         s_selftest_live = false;
     }
