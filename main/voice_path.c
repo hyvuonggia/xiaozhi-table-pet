@@ -121,6 +121,7 @@ static void vp_send_listen_stop(void)
 static bool s_armed;              /* wake seen, waiting for first speech */
 static bool s_streaming;          /* listen start sent, uplink live */
 static TickType_t s_arm_tick;     /* wake moment */
+static TickType_t s_mute_until;   /* drop audio until here (wake word tail) */
 static TickType_t s_quiet_since;  /* last tick with real (non-echo) speech */
 static TickType_t s_window_open_tick;
 static bool s_screen_listen;      /* last display_set_listening() value */
@@ -129,6 +130,9 @@ static bool s_listen_sent;        /* listen start sent for this window */
 static bool s_vad_seen;           /* VAD confirmed real speech this window */
 static uint32_t s_speech_ms;      /* real VAD speech accumulated this window */
 static bool s_closing;            /* window closed, waiting for the reply */
+static bool s_followup;           /* after a reply: listen for a follow-up */
+static TickType_t s_followup_until;
+static TickType_t s_last_tts_tick; /* last tts text/audio seen (reply end) */
 static TickType_t s_close_at;     /* when it is safe to drop the channel */
 #define VP_ARM_MS          5000u /* wait this long for the user to start */
 /* The wake word itself is still in the mic/VAD path right after WAKE.
@@ -144,6 +148,62 @@ static TickType_t s_close_at;     /* when it is safe to drop the channel */
 #define VP_WINDOW_QUIET_MS 2000u /* server VAD needs the stream through the
                                      end of the sentence */
 #define VP_WINDOW_MIN_MS   6000u /* short utterances are not cut off */
+/* After a reply the channel stays open briefly so the user can answer without
+ * repeating the wake word; kept below the server's 10 s no-voice timeout. */
+#define VP_FOLLOWUP_MS     30000u /* stay in the conversation this long */
+
+/* Small PSRAM ring used only while a channel is (re)opening: keeps the first
+ * words of a follow-up from being clipped. Flushed paced (server drops on a
+ * multi-second flood). */
+#define VP_PRE_N 20 /* 20 x 60 ms = 1.2 s */
+static uint8_t *s_pre_buf;
+static uint16_t *s_pre_len;
+static int s_pre_head, s_pre_count;
+
+static void vp_pre_reset(void)
+{
+    s_pre_head = 0;
+    s_pre_count = 0;
+}
+
+static void vp_pre_push(const uint8_t *data, size_t len)
+{
+    if (!s_pre_buf || !s_pre_len || len == 0 || len > VP_OPUS_BUF) {
+        return;
+    }
+    int idx = (s_pre_head + s_pre_count) % VP_PRE_N;
+    memcpy(s_pre_buf + (size_t)idx * VP_OPUS_BUF, data, len);
+    s_pre_len[idx] = (uint16_t)len;
+    if (s_pre_count < VP_PRE_N) {
+        s_pre_count++;
+    } else {
+        s_pre_head = (s_pre_head + 1) % VP_PRE_N;
+    }
+}
+
+static void vp_pre_flush(void)
+{
+    if (!s_pre_buf || !s_ws || s_pre_count == 0) {
+        vp_pre_reset();
+        return;
+    }
+    for (int i = 0; i < s_pre_count; i++) {
+        int idx = (s_pre_head + i) % VP_PRE_N;
+        if (s_pre_len[idx] == 0) {
+            continue;
+        }
+        if (esp_websocket_client_send_bin(s_ws,
+                (const char *)(s_pre_buf + (size_t)idx * VP_OPUS_BUF),
+                s_pre_len[idx], pdMS_TO_TICKS(VP_SEND_TIMEOUT_MS)) >= 0) {
+            s_tx_frames++;
+        } else {
+            s_tx_drop++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    ESP_LOGI(TAG, "pre-stream flush: %d frames", s_pre_count);
+    vp_pre_reset();
+}
 
 static void vp_set_screen_listen(bool on)
 {
@@ -181,6 +241,7 @@ static void vp_uplink_task(void *arg)
                 s_armed = true;
                 s_streaming = true;
                 s_closing = false;
+                s_followup = false;
                 s_listen_sent = false;
                 s_vad_seen = false;
                 s_speech_ms = 0;
@@ -188,6 +249,7 @@ static void vp_uplink_task(void *arg)
                 s_quiet_since = now;
                 s_window_open_tick = now;
                 wakeword_vad_reset(); /* confirm streak starts AFTER wake */
+                s_mute_until = now + pdMS_TO_TICKS(VP_ARM_IGNORE_MS);
                 ESP_LOGI(TAG, "WAKE -> streaming (rms=%lu vad=%d)",
                          (unsigned long)rms,
                          wakeword_vad_ready() ? 1 : 0);
@@ -270,21 +332,62 @@ static void vp_uplink_task(void *arg)
             }
         }
 
-        vp_set_screen_listen(s_armed || s_streaming);
+        vp_set_screen_listen(s_armed || s_streaming || s_followup);
 
         if (s_closing) {
-            if (s_speaking) {
-                s_close_at = now + pdMS_TO_TICKS(3000); /* reply still playing */
+            bool reply_done = !s_speaking
+                || (s_last_tts_tick != 0
+                    && (int32_t)(now - s_last_tts_tick) > (int32_t)pdMS_TO_TICKS(3000));
+            if (!reply_done) {
+                s_close_at = now + pdMS_TO_TICKS(1000); /* reply still playing */
             } else if ((int32_t)(now - s_close_at) >= 0) {
+                /* Multi-turn UX: keep the channel open for a follow-up so the
+                 * user can answer WITHOUT saying "Alexa" again (real-user
+                 * report). Close after the window, before the server's 10 s
+                 * no-voice timeout can fire its goodbye. */
                 s_closing = false;
                 if (s_speaking) {
-                    display_set_speaking(false); /* tts stop may never arrive */
+                    display_set_speaking(false);
                     s_speaking = false;
                 }
+                s_followup = true;
+                vp_pre_reset();
+                s_followup_until = now + pdMS_TO_TICKS(VP_FOLLOWUP_MS);
+                s_vad_seen = false;
+                s_speech_ms = 0;
+                s_mute_until = 0;
+                wakeword_vad_reset();
                 if (s_close_cb) {
-                    s_close_cb(); /* idle now: no server goodbye */
+                    s_close_cb(); /* close before the server's 10 s goodbye */
                 }
-                ESP_LOGI(TAG, "channel closed after reply");
+                ESP_LOGI(TAG, "follow-up window %u ms, channel closed (no wake needed)",
+                         (unsigned)VP_FOLLOWUP_MS);
+            }
+        }
+
+        if (s_followup) {
+            if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
+                /* User answered: reopen the channel and continue, no wake word.
+                 * Audio is buffered until the session is live (no clipping). */
+                s_followup = false;
+                s_streaming = true;
+                s_armed = false;
+                s_listen_sent = false;
+                s_vad_seen = true;
+                s_speech_ms = 600; /* already proven speech */
+                s_quiet_since = now;
+                s_window_open_tick = now;
+                s_mute_until = 0;
+                if (s_open_cb) {
+                    s_open_cb();
+                }
+                ESP_LOGI(TAG, "follow-up speech -> reopen + streaming (no wake)");
+            } else if ((int32_t)(now - s_followup_until) >= 0) {
+                s_followup = false;
+                if (s_close_cb) {
+                    s_close_cb();
+                }
+                ESP_LOGI(TAG, "follow-up window over: channel closed");
             }
         }
 
@@ -292,6 +395,14 @@ static void vp_uplink_task(void *arg)
          * keeps the newest ~480 ms, so when streaming starts the words said
          * immediately after "Alexa" are still there (fast speech no longer
          * loses its first half). */
+        if (s_streaming && !s_speaking && (!s_session || !s_ws)) {
+            /* Channel is still connecting: buffer the first words. */
+            int pn = audio_in_pop_opus(buf, sizeof(buf), 20);
+            if (pn > 0) {
+                vp_pre_push(buf, (size_t)pn);
+            }
+            continue;
+        }
         if (!s_streaming || s_speaking || !s_session || !s_ws) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -299,8 +410,10 @@ static void vp_uplink_task(void *arg)
         if (!s_listen_sent) {
             vp_send_listen_start(); /* session is live now */
             s_listen_sent = s_listening;
+            vp_pre_flush(); /* words said while the channel was opening */
         }
-        if ((int32_t)(now - s_arm_tick) < (int32_t)pdMS_TO_TICKS(VP_ARM_IGNORE_MS)) {
+        if (s_mute_until != 0
+            && (int32_t)(now - s_mute_until) < 0) {
             /* Do not send the wake word itself: the server would transcribe
              * "Alexa" and answer it ("Chào sếp..."). Keep the queue fresh. */
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -359,6 +472,18 @@ void voice_path_start(esp_websocket_client_handle_t ws,
     s_ws = ws;
     s_open_cb = open_cb;
     s_close_cb = close_cb;
+    if (!s_pre_buf) {
+        s_pre_buf = heap_caps_malloc((size_t)VP_PRE_N * VP_OPUS_BUF,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_pre_len = calloc(VP_PRE_N, sizeof(uint16_t));
+        if (!s_pre_buf || !s_pre_len) {
+            free(s_pre_buf);
+            free(s_pre_len);
+            s_pre_buf = NULL;
+            s_pre_len = NULL;
+            ESP_LOGW(TAG, "no pre-stream ring (follow-up may clip)");
+        }
+    }
     wakeword_init(); /* idempotent; soft-fails to "no wake" if PSRAM/model bad */
     if (s_task_on) {
         return;
@@ -389,6 +514,7 @@ void voice_path_on_ws_disconnected(void)
     s_armed = false;
     s_streaming = false; /* fresh WAKE required next session */
     s_closing = false;
+    s_followup = false;
     s_vad_unready_warned = false;
     if (s_screen_listen) {
         s_screen_listen = false;
@@ -640,6 +766,7 @@ void voice_path_on_ws_text(const char *data, size_t len)
         const char *text = cJSON_IsString(tx) ? tx->valuestring : NULL;
         cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "state");
         const char *state = cJSON_IsString(st) ? st->valuestring : "?";
+        s_last_tts_tick = xTaskGetTickCount();
         if (text && msg_filter_is_tool_json(text)) {
             /* E2 rule: tool-call JSON must NEVER reach the speaker. */
             ESP_LOGW(TAG, "tts DROP tool-JSON (state=%s): %.120s", state, text);
@@ -714,6 +841,7 @@ void voice_path_on_ws_binary(const uint8_t *data, size_t len)
     }
     /* NOTE: no barge-in yet — loud mic input while the speaker plays does
      * not abort. Mic VAD gates the window; server VAD owns segmentation. */
+    s_last_tts_tick = xTaskGetTickCount();
     s_rx_frames++;
     if (len < s_rx_len_min) {
         s_rx_len_min = len;
