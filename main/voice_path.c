@@ -145,63 +145,6 @@ static TickType_t s_close_at;     /* when it is safe to drop the channel */
                                      end of the sentence */
 #define VP_WINDOW_MIN_MS   6000u /* short utterances are not cut off */
 
-/* Pre-stream audio ring: while the window is armed we keep the newest opus
- * frames (PSRAM) so words spoken right after "Alexa" are sent once streaming
- * starts. VADNet confirmation can take a second; without this the first half
- * of a fast question was lost. */
-#define VP_PRE_N 100 /* 100 x 60 ms = 6 s (PSRAM) */
-static uint8_t *s_pre_buf;
-static uint16_t *s_pre_len;
-static int s_pre_head, s_pre_count;
-
-static void vp_pre_reset(void)
-{
-    s_pre_head = 0;
-    s_pre_count = 0;
-}
-
-static void vp_pre_push(const uint8_t *data, size_t len)
-{
-    if (!s_pre_buf || !s_pre_len || len == 0 || len > VP_OPUS_BUF) {
-        return;
-    }
-    int idx = (s_pre_head + s_pre_count) % VP_PRE_N;
-    memcpy(s_pre_buf + (size_t)idx * VP_OPUS_BUF, data, len);
-    s_pre_len[idx] = (uint16_t)len;
-    if (s_pre_count < VP_PRE_N) {
-        s_pre_count++;
-    } else {
-        s_pre_head = (s_pre_head + 1) % VP_PRE_N;
-    }
-}
-
-static void vp_pre_flush(void)
-{
-    if (!s_pre_buf || !s_ws) {
-        vp_pre_reset();
-        return;
-    }
-    for (int i = 0; i < s_pre_count; i++) {
-        int idx = (s_pre_head + i) % VP_PRE_N;
-        if (s_pre_len[idx] == 0) {
-            continue;
-        }
-        if (esp_websocket_client_send_bin(s_ws,
-                (const char *)(s_pre_buf + (size_t)idx * VP_OPUS_BUF),
-                s_pre_len[idx], pdMS_TO_TICKS(VP_SEND_TIMEOUT_MS)) >= 0) {
-            s_tx_frames++;
-        } else {
-            s_tx_drop++;
-        }
-        /* Pace the catch-up burst: the server closes the socket on a
-         * multi-second flood (transport_poll_write(0), seen live). */
-        vTaskDelay(pdMS_TO_TICKS(12));
-    }
-    ESP_LOGI(TAG, "pre-stream flush: %d frames (%.1f s)",
-             s_pre_count, s_pre_count * 0.06);
-    vp_pre_reset();
-}
-
 static void vp_set_screen_listen(bool on)
 {
     if (on != s_screen_listen) {
@@ -404,20 +347,6 @@ void voice_path_start(esp_websocket_client_handle_t ws,
     s_ws = ws;
     s_open_cb = open_cb;
     s_close_cb = close_cb;
-    if (!s_pre_buf) {
-        s_pre_buf = heap_caps_malloc((size_t)VP_PRE_N * VP_OPUS_BUF,
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_pre_len = calloc(VP_PRE_N, sizeof(uint16_t));
-        if (!s_pre_buf || !s_pre_len) {
-            ESP_LOGW(TAG, "pre-stream ring unavailable (first word may clip)");
-            free(s_pre_buf);
-            free(s_pre_len);
-            s_pre_buf = NULL;
-            s_pre_len = NULL;
-        } else {
-            ESP_LOGI(TAG, "pre-stream ring %d frames (PSRAM)", VP_PRE_N);
-        }
-    }
     wakeword_init(); /* idempotent; soft-fails to "no wake" if PSRAM/model bad */
     if (s_task_on) {
         return;
