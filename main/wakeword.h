@@ -55,6 +55,11 @@ uint32_t wakeword_vad_streak(void);       /* consecutive VAD_SPEECH frames */
 TickType_t wakeword_vad_last_speech_tick(void); /* last VAD_SPEECH tick, 0 = none */
 bool wakeword_vad_speech_now(void);       /* most recent VAD frame was speech */
 void wakeword_vad_reset(void);            /* clear streak/state (call on wake) */
+/* Drop every buffered VAD frame and clear the streak. Called when the
+ * follow-up window opens: the VAD ring still holds the tail of our own TTS
+ * (the mic hears the speaker), which otherwise re-opens the channel ~40 ms
+ * after the answer and makes the robot talk to itself. */
+void wakeword_vad_flush(void);
 
 #ifdef __cplusplus
 }

@@ -132,6 +132,7 @@ static uint32_t s_speech_ms;      /* real VAD speech accumulated this window */
 static bool s_closing;            /* window closed, waiting for the reply */
 static bool s_followup;           /* after a reply: listen for a follow-up */
 static TickType_t s_followup_until;
+static TickType_t s_followup_guard_until; /* drop our own TTS tail/echo */
 static TickType_t s_last_tts_tick; /* last tts text/audio seen (reply end) */
 static bool s_reply_done;          /* tts stop seen for this turn */
 static TickType_t s_close_at;     /* when it is safe to drop the channel */
@@ -152,6 +153,11 @@ static TickType_t s_close_at;     /* when it is safe to drop the channel */
 /* After a reply the channel stays open briefly so the user can answer without
  * repeating the wake word; kept below the server's 10 s no-voice timeout. */
 #define VP_FOLLOWUP_MS     30000u /* stay in the conversation this long */
+/* The speaker's tail is still in the mic ring/VAD backlog when the reply
+ * ends. Live-tested bug: the follow-up reopened 40 ms after TTS stop, sent
+ * "đây", and the server answered on its own. Drop the stale queue and ignore
+ * VAD for this long before the window may reopen. */
+#define VP_FOLLOWUP_GUARD_MS 900u
 
 /* Small PSRAM ring used only while a channel is (re)opening: keeps the first
  * words of a follow-up from being clipped. Flushed paced (server drops on a
@@ -206,6 +212,61 @@ static void vp_pre_flush(void)
     vp_pre_reset();
 }
 
+/* Tiny onset ring (6 x 60 ms): VAD confirms speech ~100-300 ms after the
+ * first phoneme, and the silence gate used to DROP that phoneme ("lắc đầu"
+ * -> "bắt đầu"). Keep only a short pre-roll and flush it at 40 ms/frame:
+ * a 1.2 s burst made the server split one question into two utterances. */
+#define VP_ONSET_N 6
+static uint8_t *s_onset_buf;
+static uint16_t *s_onset_len;
+static int s_onset_head, s_onset_count;
+
+static void vp_onset_reset(void)
+{
+    s_onset_head = 0;
+    s_onset_count = 0;
+}
+
+static void vp_onset_push(const uint8_t *data, size_t len)
+{
+    if (!s_onset_buf || !s_onset_len || len == 0 || len > VP_OPUS_BUF) {
+        return;
+    }
+    int idx = (s_onset_head + s_onset_count) % VP_ONSET_N;
+    memcpy(s_onset_buf + (size_t)idx * VP_OPUS_BUF, data, len);
+    s_onset_len[idx] = (uint16_t)len;
+    if (s_onset_count < VP_ONSET_N) {
+        s_onset_count++;
+    } else {
+        s_onset_head = (s_onset_head + 1) % VP_ONSET_N;
+    }
+}
+
+static void vp_onset_flush(void)
+{
+    if (!s_onset_buf || !s_ws || s_onset_count == 0) {
+        vp_onset_reset();
+        return;
+    }
+    int n = s_onset_count;
+    for (int i = 0; i < n; i++) {
+        int idx = (s_onset_head + i) % VP_ONSET_N;
+        if (s_onset_len[idx] == 0) {
+            continue;
+        }
+        if (esp_websocket_client_send_bin(s_ws,
+                (const char *)(s_onset_buf + (size_t)idx * VP_OPUS_BUF),
+                s_onset_len[idx], pdMS_TO_TICKS(VP_SEND_TIMEOUT_MS)) >= 0) {
+            s_tx_frames++;
+        } else {
+            s_tx_drop++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40)); /* near real-time, no burst */
+    }
+    ESP_LOGI(TAG, "onset flush: %d frames", n);
+    vp_onset_reset();
+}
+
 static void vp_set_screen_listen(bool on)
 {
     if (on != s_screen_listen) {
@@ -249,6 +310,8 @@ static void vp_uplink_task(void *arg)
                 s_arm_tick = now;
                 s_quiet_since = now;
                 s_window_open_tick = now;
+                vp_pre_reset(); /* no stale silence from the last session */
+                vp_onset_reset();
                 wakeword_vad_reset(); /* confirm streak starts AFTER wake */
                 s_mute_until = now + pdMS_TO_TICKS(VP_ARM_IGNORE_MS);
                 ESP_LOGI(TAG, "WAKE -> streaming (rms=%lu vad=%d)",
@@ -338,8 +401,6 @@ static void vp_uplink_task(void *arg)
             }
         }
 
-        vp_set_screen_listen(s_armed || s_streaming || s_followup);
-
         if (s_closing) {
             if (s_speaking) {
                 s_close_at = now + pdMS_TO_TICKS(1000); /* reply still playing */
@@ -356,11 +417,18 @@ static void vp_uplink_task(void *arg)
                 s_followup = true;
                 display_set_thinking(false);
                 vp_pre_reset();
+                vp_onset_reset();
                 s_followup_until = now + pdMS_TO_TICKS(VP_FOLLOWUP_MS);
                 s_vad_seen = false;
                 s_speech_ms = 0;
                 s_mute_until = 0;
-                wakeword_vad_reset();
+                /* Flush the echo of our own reply before listening again:
+                 * wakeword_vad_reset() alone left the TTS tail in the VAD
+                 * ring and the audio_in queue, which immediately reopened
+                 * the window and made the robot answer itself. */
+                wakeword_vad_flush();
+                s_followup_guard_until =
+                    now + pdMS_TO_TICKS(VP_FOLLOWUP_GUARD_MS);
                 if (s_close_cb) {
                     s_close_cb(); /* close before the server's 10 s goodbye */
                 }
@@ -370,7 +438,13 @@ static void vp_uplink_task(void *arg)
         }
 
         if (s_followup) {
-            if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
+            /* Never forward the reply's tail: keep the mic queue fresh so the
+             * reopen below starts on the user's voice, not our echo. */
+            while (audio_in_pop_opus(buf, sizeof(buf), 0) > 0) {
+            }
+            if ((int32_t)(now - s_followup_guard_until) < 0) {
+                /* echo guard: ignore VAD while the speaker tail decays */
+            } else if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
                 /* User answered: reopen the channel and continue, no wake word.
                  * Audio is buffered until the session is live (no clipping). */
                 s_followup = false;
@@ -394,6 +468,12 @@ static void vp_uplink_task(void *arg)
                 ESP_LOGI(TAG, "follow-up window over: channel closed");
             }
         }
+
+        /* Reflect the FINAL state of this iteration (after close/follow-up
+         * transitions). Calling this before them made the screen flash
+         * SAN SANG for up to 800 ms between DANG NOI and the follow-up
+         * DANG NGHE, and a stale frame could paint it while listening. */
+        vp_set_screen_listen(s_armed || s_streaming || s_followup);
 
         /* Do NOT drain the mic queue while we are not sending: the queue
          * keeps the newest ~480 ms, so when streaming starts the words said
@@ -430,9 +510,18 @@ static void vp_uplink_task(void *arg)
         if (s_vad_seen) {
             TickType_t last_sp = wakeword_vad_last_speech_tick();
             if ((int32_t)(now - last_sp) > (int32_t)pdMS_TO_TICKS(400)) {
-                audio_in_pop_opus(buf, sizeof(buf), 0); /* keep queue fresh */
+                /* Silence: keep only a short onset pre-roll instead of
+                 * transmitting room noise. Without it the first phoneme was
+                 * lost before VAD confirmed the next word. */
+                int pn = audio_in_pop_opus(buf, sizeof(buf), 0);
+                if (pn > 0) {
+                    vp_onset_push(buf, (size_t)pn);
+                }
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
+            }
+            if (s_onset_count > 0) {
+                vp_onset_flush(); /* speech resumed: send the onset pre-roll */
             }
         }
 
@@ -486,6 +575,18 @@ void voice_path_start(esp_websocket_client_handle_t ws,
             s_pre_buf = NULL;
             s_pre_len = NULL;
             ESP_LOGW(TAG, "no pre-stream ring (follow-up may clip)");
+        }
+    }
+    if (!s_onset_buf) {
+        s_onset_buf = heap_caps_malloc((size_t)VP_ONSET_N * VP_OPUS_BUF,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_onset_len = calloc(VP_ONSET_N, sizeof(uint16_t));
+        if (!s_onset_buf || !s_onset_len) {
+            free(s_onset_buf);
+            free(s_onset_len);
+            s_onset_buf = NULL;
+            s_onset_len = NULL;
+            ESP_LOGW(TAG, "no onset ring (first word may clip)");
         }
     }
     wakeword_init(); /* idempotent; soft-fails to "no wake" if PSRAM/model bad */
@@ -798,6 +899,12 @@ void voice_path_on_ws_text(const char *data, size_t len)
                 s_reply_done = true;
                 s_close_at = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
                 display_set_thinking(false);
+                if (s_closing) {
+                    /* Reply finished -> 30 s follow-up window. Set LISTEN
+                     * before clearing SPEAK so the state goes DANG NOI ->
+                     * DANG NGHE with no IDLE/SAN SANG frame in between. */
+                    display_set_listening(true);
+                }
                 display_set_speaking(false);
                 if (s_speaking && s_tx_gated > 0) {
                     ESP_LOGI(TAG, "tts stop: resumed uplink (%lu gated while speaking)",
@@ -856,6 +963,13 @@ void voice_path_on_ws_binary(const uint8_t *data, size_t len)
     }
     /* NOTE: no barge-in yet — loud mic input while the speaker plays does
      * not abort. Mic VAD gates the window; server VAD owns segmentation. */
+    if (s_mute_until != 0
+        && (int32_t)(xTaskGetTickCount() - s_mute_until) < 0) {
+        s_rx_muted++; /* server-error utterance: silenced by text filter.
+                       * Check BEFORE claiming SPEAK: the audio is dropped, so
+                       * DANG NOI would be a lie for the whole 3 s error clip. */
+        return;
+    }
     s_last_tts_tick = xTaskGetTickCount();
     if (!s_speaking) {
         display_set_thinking(false);
@@ -877,11 +991,6 @@ void voice_path_on_ws_binary(const uint8_t *data, size_t len)
         s_rx_len_min = 9999;
         s_rx_len_max = 0;
         s_rx_len_sum = 0;
-    }
-    if (s_mute_until != 0
-        && (int32_t)(xTaskGetTickCount() - s_mute_until) < 0) {
-        s_rx_muted++; /* server-error utterance: silenced by text filter */
-        return;
     }
     if (audio_out_push_opus(data, len) != 0) {
         s_rx_drop++; /* queue full: drop-on-full, never block */

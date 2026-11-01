@@ -18,6 +18,10 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+/* Runtime bus recovery: a brownout leaves the I2C controller driving both
+ * lines low; deleting the bus alone does not reset the peripheral. */
+#include "esp_private/periph_ctrl.h"
+#include "soc/periph_defs.h"
 
 static const char *TAG = "display";
 
@@ -33,7 +37,10 @@ static const char *TAG = "display";
 #define DISP_PAGES       8
 #define DISP_LOCK_MS     2000         /* SPEC section 5.4 #17: <= 2 s */
 #define DISP_MIN_GAP_MS  200          /* <= 5 fps */
-#define DISP_TASK_PRIO   2
+/* Prio 4: prio 2 starved for the whole TTS burst (WakeNet prio 4 + WS/speaker
+ * prio 5 on 160 MHz), so DANG NOI was never painted. 4 shares fairly with
+ * wake/uplink but stays below mic (8) and speaker (5), so audio never gaps. */
+#define DISP_TASK_PRIO   4
 #define DISP_TASK_STACK  4096         /* >= 3072; fb ops + 129 B tx buf */
 #define DISP_UNHEALTHY_MS 90000       /* stuck wanted-frame -> unhealthy */
 #define DISP_RETRY_INIT_LOOPS 100     /* task tick 50 ms -> re-init ~5 s */
@@ -577,12 +584,20 @@ static void disp_task(void *arg)
             bool need_rescue = up > 10000;
             xSemaphoreGive(s_lock);
             if (need_rescue) {
-                ESP_LOGW(TAG, "panel still dark after %lus: bus rescue",
-                         (unsigned long)(up / 1000));
-                gpio_clock_rescue();
+                ESP_LOGW(TAG, "panel still dark after %lus: bus rescue "
+                         "(SDA=%d SCL=%d)", (unsigned long)(up / 1000),
+                         gpio_get_level(DISP_SDA_GPIO),
+                         gpio_get_level(DISP_SCL_GPIO));
+                /* A teardown failure can leave s_bus live with s_hw_ok
+                 * false; deleting it here prevents i2c_new_master_bus from
+                 * failing forever after the first illness. */
                 if (s_bus) {
-                    i2c_master_bus_reset(s_bus); /* best-effort */
+                    disp_hw_teardown();
                 }
+                gpio_clock_rescue();
+                ESP_LOGW(TAG, "after clocks: SDA=%d SCL=%d",
+                         gpio_get_level(DISP_SDA_GPIO),
+                         gpio_get_level(DISP_SCL_GPIO));
             }
             if (!take_lock()) {
                 continue;
@@ -637,10 +652,13 @@ static void disp_task(void *arg)
             xSemaphoreGive(s_lock);
             continue;
         }
-        /* Snapshot under lock, release before the slow I2C. */
+        /* Snapshot under lock, release before the slow I2C. The request
+         * generation is snapshotted too: a state flip during the ~200 ms
+         * frame must not be lost when dirty is cleared at the end. */
         disp_state_t st = display_state_locked();
         bool wifi = s_wifi, sess = s_session;
         int vol = s_vol;
+        uint32_t req_at = s_requested;
         xSemaphoreGive(s_lock);
 
         s_last_attempt_ms = now_ms();
@@ -658,8 +676,12 @@ static void disp_task(void *arg)
                     };
                     ESP_LOGI(TAG, "painted: %s", names[(int)st]);
                 }
-                /* Clear dirty only if nobody re-dirtied mid-frame. */
-                s_dirty = false;
+                /* Clear dirty ONLY if nobody requested a newer frame while
+                 * this one was being written. Unconditional clear dropped
+                 * state flips (DANG NOI) that arrived mid-frame. */
+                if (s_requested == req_at) {
+                    s_dirty = false;
+                }
                 ESP_LOGI(TAG, "frame ok: req=%lu done=%lu drops=%lu",
                          (unsigned long)s_requested,
                          (unsigned long)s_completed,
@@ -853,6 +875,11 @@ bool display_healthy(void)
 /* 9 full-byte clocks + STOP on bare GPIO, then pullups + re-init. */
 static void gpio_clock_rescue(void)
 {
+    /* Reset the I2C controller registers too: after a rail dip the block can
+     * sit with SCL/SDA driven low, and deleting the driver does not clear
+     * that. A chip reset used to be the only cure; this is the same reset
+     * scoped to the peripheral. */
+    periph_module_reset(PERIPH_I2C0_MODULE);
     gpio_reset_pin(DISP_SCL_GPIO);
     gpio_reset_pin(DISP_SDA_GPIO);
     gpio_set_direction(DISP_SCL_GPIO, GPIO_MODE_OUTPUT_OD);
@@ -861,22 +888,27 @@ static void gpio_clock_rescue(void)
     gpio_pullup_en(DISP_SDA_GPIO);
     gpio_set_level(DISP_SDA_GPIO, 1);
     gpio_set_level(DISP_SCL_GPIO, 1);
-    esp_rom_delay_us(50);
-    for (int i = 0; i < 9; i++) {
-        gpio_set_level(DISP_SCL_GPIO, 0);
-        esp_rom_delay_us(50);
+    esp_rom_delay_us(200);
+    /* Three rounds: a brownout-latched SH1106 can need more than one byte
+     * of clocks to release SDA (live: one round left SDA low). */
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level(DISP_SCL_GPIO, 0);
+            esp_rom_delay_us(100);
+            gpio_set_level(DISP_SCL_GPIO, 1);
+            esp_rom_delay_us(100);
+        }
+        /* STOP: SDA low -> SCL high -> SDA high. */
+        gpio_set_level(DISP_SDA_GPIO, 0);
+        esp_rom_delay_us(100);
         gpio_set_level(DISP_SCL_GPIO, 1);
-        esp_rom_delay_us(50);
+        esp_rom_delay_us(100);
+        gpio_set_level(DISP_SDA_GPIO, 1);
+        esp_rom_delay_us(200);
     }
-    /* STOP: SDA low -> SCL high -> SDA high. */
-    gpio_set_level(DISP_SDA_GPIO, 0);
-    esp_rom_delay_us(50);
-    gpio_set_level(DISP_SCL_GPIO, 1);
-    esp_rom_delay_us(50);
-    gpio_set_level(DISP_SDA_GPIO, 1);
-    esp_rom_delay_us(50);
     gpio_pullup_en(DISP_SDA_GPIO);
     gpio_pullup_en(DISP_SCL_GPIO);
+    esp_rom_delay_us(50000); /* idle-high settle before re-init */
 }
 
 bool display_rescue_bus(void)

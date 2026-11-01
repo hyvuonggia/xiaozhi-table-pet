@@ -42,7 +42,8 @@ extern "C" {
 #endif
 
 /* Idempotent. Inits pullups + I2C + SH1106, paints boot frame
- * (SAN SANG + icons), spawns the render task (prio 2). Soft-fails:
+ * (SAN SANG + icons), spawns the render task (prio 4: below audio, but
+ * high enough not to starve during a TTS burst). Soft-fails:
  * if the bus is down at boot the task keeps retrying; never aborts. */
 void display_init(void);
 

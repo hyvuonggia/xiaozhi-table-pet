@@ -29,12 +29,20 @@ static const char *TAG = "servo";
 #define SERVO_DEBOUNCE_MS 3000 /* SPEC §5.5 #22 */
 #define SERVO_STEP_MS  400
 #define SERVO_DEMO_DELAY_MS 1000
+/* The 3V3 rail is shared with the display/amp and powered from laptop USB
+ * (SPEC §2.3): a 30-60 deg jump browns the SH1106 out and latches SDA low.
+ * Move in 5 deg steps instead of one jump (same one nod/shake, lower peak
+ * current). Live-tested: K-shake killed the panel on the jump version. */
+#define SERVO_RAMP_STEP_DEG 5
+#define SERVO_RAMP_STEP_MS  60
 
 /* THE servo lock: the single mutex guarding all PWM writes. */
 static SemaphoreHandle_t s_lock;
 static bool s_ready;
 static TickType_t s_last_motion;
 static bool s_have_motion;
+static int s_cur_h = 90; /* last successfully written angles (for ramping) */
+static int s_cur_v = 90;
 
 static int clamp_angle(int a)
 {
@@ -90,9 +98,39 @@ static void servo_move_both(int h_angle, int v_angle)
                  h_angle, v_angle, (int)uh, (int)uv);
         return;
     }
+    s_cur_h = h_angle;
+    s_cur_v = v_angle;
     ESP_LOGI(TAG, "angles H=%d (%luus) V=%d (%luus)",
              h_angle, (unsigned long)angle_to_us(h_angle),
              v_angle, (unsigned long)angle_to_us(v_angle));
+}
+
+/* Move to (h_to,v_to) in small steps: one logical nod/shake, low peak
+ * current on the shared 3V3 rail (see SERVO_RAMP_* above). */
+static void servo_ramp_both(int h_to, int v_to)
+{
+    h_to = clamp_angle(h_to);
+    v_to = clamp_angle(v_to);
+    int h = s_cur_h;
+    int v = s_cur_v;
+    while (h != h_to || v != v_to) {
+        int dh = h_to - h;
+        int dv = v_to - v;
+        if (dh > SERVO_RAMP_STEP_DEG) {
+            dh = SERVO_RAMP_STEP_DEG;
+        } else if (dh < -SERVO_RAMP_STEP_DEG) {
+            dh = -SERVO_RAMP_STEP_DEG;
+        }
+        if (dv > SERVO_RAMP_STEP_DEG) {
+            dv = SERVO_RAMP_STEP_DEG;
+        } else if (dv < -SERVO_RAMP_STEP_DEG) {
+            dv = -SERVO_RAMP_STEP_DEG;
+        }
+        h += dh;
+        v += dv;
+        servo_move_both(h, v);
+        vTaskDelay(pdMS_TO_TICKS(SERVO_RAMP_STEP_MS));
+    }
 }
 
 /* 3 s debounce for motion commands. Returns true when the motion may run
@@ -124,10 +162,10 @@ void servo_nod_once(void)
     }
     /* EXACTLY one down-up (SPEC §5.5 #21): V 90 -> 60 -> 90, H stays 90. */
     ESP_LOGI(TAG, "nod step 1/2 V=60 (down)");
-    servo_move_both(90, 60);
+    servo_ramp_both(90, 60);
     vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
     ESP_LOGI(TAG, "nod step 2/2 V=90 (up)");
-    servo_move_both(90, 90);
+    servo_ramp_both(90, 90);
     ESP_LOGI(TAG, "nod done (one down-up)");
 }
 
@@ -138,13 +176,13 @@ void servo_shake_once(void)
     }
     /* EXACTLY one left-right: H 90 -> 60 -> 120 -> 90, V stays 90. */
     ESP_LOGI(TAG, "shake step 1/3 H=60 (left)");
-    servo_move_both(60, 90);
+    servo_ramp_both(60, 90);
     vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
     ESP_LOGI(TAG, "shake step 2/3 H=120 (right)");
-    servo_move_both(120, 90);
+    servo_ramp_both(120, 90);
     vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
     ESP_LOGI(TAG, "shake step 3/3 H=90 (center)");
-    servo_move_both(90, 90);
+    servo_ramp_both(90, 90);
     ESP_LOGI(TAG, "shake done (one left-right)");
 }
 

@@ -440,3 +440,13 @@ void wakeword_vad_reset(void)
     s_vad_now = false;
     portEXIT_CRITICAL(&s_mux);
 }
+
+void wakeword_vad_flush(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    s_vad_tail = s_vad_head; /* discard buffered (echo) audio */
+    s_vad_streak = 0;
+    s_vad_now = false;
+    s_vad_last_speech = 0;
+    portEXIT_CRITICAL(&s_mux);
+}
