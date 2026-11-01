@@ -144,6 +144,10 @@ static TickType_t s_close_at;     /* when it is safe to drop the channel */
 /* VADNet frames are ~30 ms: 3 consecutive SPEECH frames (~90 ms) confirm.
  * Isolated music blips never streak; real speech always does. */
 #define VP_VAD_CONFIRM_FRAMES 2u
+/* The 30 s follow-up window must not reopen on a click/chair creak: a real
+ * next sentence sustains VAD for >150 ms; 2 frames (~60 ms) was a blip
+ * magnet (live: reopened 29 s into the window with zero STT). */
+#define VP_FOLLOWUP_CONFIRM_FRAMES 5u
 /* While streaming, VAD speech within the last 500 ms counts as activity;
  * longer gaps let the 2 s quiet timer below run out and close the window. */
 #define VP_VAD_HOLD_MS      500u
@@ -444,7 +448,7 @@ static void vp_uplink_task(void *arg)
             }
             if ((int32_t)(now - s_followup_guard_until) < 0) {
                 /* echo guard: ignore VAD while the speaker tail decays */
-            } else if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
+            } else if (wakeword_vad_streak() >= VP_FOLLOWUP_CONFIRM_FRAMES) {
                 /* User answered: reopen the channel and continue, no wake word.
                  * Audio is buffered until the session is live (no clipping). */
                 s_followup = false;
@@ -452,7 +456,9 @@ static void vp_uplink_task(void *arg)
                 s_armed = false;
                 s_listen_sent = false;
                 s_vad_seen = true;
-                s_speech_ms = 600; /* already proven speech */
+                s_speech_ms = 0; /* count real speech after reopen: a blip
+                                  * that passes the confirm must not become a
+                                  * fake "awaiting reply" (DANG NGHI) state */
                 s_quiet_since = now;
                 s_window_open_tick = now;
                 s_mute_until = 0;

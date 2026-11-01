@@ -610,6 +610,8 @@ static void ota_fetch_blocking(const char *ota_url)
  * goodbye ("tạm biệt sếp") for no reason. So: open on wake, close when the
  * conversation window closes. */
 static volatile bool s_ws_intentional_close;
+static volatile bool s_ws_probe;   /* idle health probe while offline */
+static TickType_t s_last_probe;
 
 bool ws_link_faulty(void);
 
@@ -622,49 +624,89 @@ void ws_close_idle(void);
 static void ws_client_create(void);
 static volatile bool s_ws_want_open;
 static bool s_ws_ctl_on;
-static volatile int s_ws_fail;      /* consecutive failed open attempts */
+static volatile int s_ws_fail;      /* failed open attempts (screen offline) */
 static TickType_t s_ws_open_tick;   /* when the current open attempt started */
 
 /* True when the assistant is unreachable even though WiFi is up, so the
  * screen can say MAT KET NOI instead of pretending everything is fine. */
 bool ws_link_faulty(void)
 {
-    return s_ws_fail >= 3;
+    /* One failed connect is enough to tell the user: live test N requires
+     * MAT KET NOI within 10 s, and three wakes could never fit that budget.
+     * A successful hello/session_id clears it immediately. */
+    return s_ws_fail >= 1;
+}
+
+static void ws_note_failure(const char *why)
+{
+    if (s_ws_fail < 99) {
+        s_ws_fail++;
+    }
+    ESP_LOGW(TAG, "ws failure (%s), fail=%d", why, s_ws_fail);
 }
 
 static void ws_control_task(void *arg)
 {
     (void)arg;
     while (1) {
+        TickType_t now = xTaskGetTickCount();
         if (s_ws_want_open && !s_ws) {
+            s_ws_probe = false; /* a real conversation takes over */
             s_ws_intentional_close = false;
             s_got_session_id = false;
             ws_client_create(); /* lazy: no idle client eating internal RAM */
-            s_ws_open_tick = xTaskGetTickCount();
+            s_ws_open_tick = now;
             if (s_ws) {
                 esp_err_t err = esp_websocket_client_start(s_ws);
                 ESP_LOGI(TAG, "ws open (wake): %s", esp_err_to_name(err));
-                if (err != ESP_OK && s_ws_fail < 99) {
-                    s_ws_fail++;
+                if (err != ESP_OK) {
+                    ws_note_failure("start");
                 }
-            } else if (s_ws_fail < 99) {
-                s_ws_fail++;
+            } else {
+                ws_note_failure("create");
             }
+        } else if (!s_ws_want_open && !s_ws && s_ws_fail > 0
+                   && (s_last_probe == 0
+                       || (int32_t)(now - s_last_probe) > (int32_t)pdMS_TO_TICKS(15000))) {
+            /* Server was unreachable: probe it every 15 s while idle. The
+             * hello alone is enough to clear MAT KET NOI; close immediately
+             * afterwards so the server's 10 s no-voice goodbye never fires. */
+            s_ws_probe = true;
+            s_ws_intentional_close = false;
+            s_got_session_id = false;
+            ws_client_create();
+            s_ws_open_tick = now;
+            s_last_probe = now;
+            if (s_ws) {
+                esp_err_t err = esp_websocket_client_start(s_ws);
+                ESP_LOGI(TAG, "ws probe open: %s", esp_err_to_name(err));
+                if (err != ESP_OK) {
+                    ws_note_failure("probe start");
+                }
+            } else {
+                ws_note_failure("probe create");
+            }
+        } else if (s_ws_probe && s_ws && s_got_session_id) {
+            /* Server is back: hello reset s_ws_fail; let the close branch
+             * destroy this short-lived probe session. */
+            s_ws_probe = false;
+            ESP_LOGI(TAG, "ws probe OK: server reachable again");
+        } else if (s_ws_probe && s_ws && !s_got_session_id
+                   && (int32_t)(now - s_ws_open_tick) > (int32_t)pdMS_TO_TICKS(6000)) {
+            ws_note_failure("probe no session");
+            s_ws_probe = false; /* close below; retry in 15 s */
         } else if (s_ws_want_open && s_ws && !s_got_session_id
                    && s_ws_open_tick != 0
-                   && (int32_t)(xTaskGetTickCount() - s_ws_open_tick)
-                          > (int32_t)pdMS_TO_TICKS(6000)) {
+                   && (int32_t)(now - s_ws_open_tick) > (int32_t)pdMS_TO_TICKS(6000)) {
             /* Connected but no hello/session within 6 s: server unhealthy. */
-            if (s_ws_fail < 99) {
-                s_ws_fail++;
-            }
-            s_ws_open_tick = xTaskGetTickCount();
-            ESP_LOGW(TAG, "ws open but no session in 6 s (fail=%d)", s_ws_fail);
-        } else if (!s_ws_want_open && s_ws) {
+            ws_note_failure("no session");
+            s_ws_open_tick = now;
+        } else if (!s_ws_want_open && s_ws && !s_ws_probe) {
             esp_websocket_client_handle_t h = s_ws;
             s_ws = NULL;
             s_ws_intentional_close = true;
             s_got_session_id = false;
+            s_ws_probe = false;
             voice_path_set_ws(NULL);
             (void)esp_websocket_client_stop(h);
             (void)esp_websocket_client_destroy(h);
@@ -711,7 +753,12 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         }
         /* Driver auto-reconnect (reconnect_timeout_ms=10 s) handles this;
          * a second hand-rolled task used to OOM on internal RAM and shadow
-         * the driver's own retry. */
+         * the driver's own retry. Count it so the screen can say MAT KET NOI
+         * even if the silent-abort window closes before the 6 s session
+         * deadline. */
+        if (s_ws_want_open || s_ws_probe) {
+            ws_note_failure("disconnected");
+        }
         ESP_LOGW(TAG, "ws disconnected (driver will retry)");
     } else if (id == WEBSOCKET_EVENT_DATA && ev && ev->data_ptr && ev->data_len > 0) {
         /* P2b voice path: binary opus -> speaker, text control -> dispatch.
@@ -750,6 +797,9 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         }
         cJSON_Delete(root);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
+        if (s_ws_want_open || s_ws_probe) {
+            ws_note_failure("error");
+        }
         ESP_LOGW(TAG, "ws error");
     }
 }
@@ -799,6 +849,7 @@ static void ws_client_create(void)
 /* Called by the voice path on a wake word: open the audio channel. */
 void ws_open_for_wake(void)
 {
+    s_ws_probe = false; /* a wake supersedes an idle probe */
     s_ws_want_open = true; /* the control task does the real work */
 }
 
