@@ -127,13 +127,14 @@ static bool s_screen_listen;      /* last display_set_listening() value */
 static bool s_vad_unready_warned; /* throttled "VAD missing" log */
 static bool s_listen_sent;        /* listen start sent for this window */
 static bool s_vad_seen;           /* VAD confirmed real speech this window */
+static uint32_t s_speech_ms;      /* real VAD speech accumulated this window */
 static bool s_closing;            /* window closed, waiting for the reply */
 static TickType_t s_close_at;     /* when it is safe to drop the channel */
 #define VP_ARM_MS          5000u /* wait this long for the user to start */
 /* The wake word itself is still in the mic/VAD path right after WAKE.
  * Ignore that tail, then require neural-VAD speech (not room noise) to
  * confirm the user is actually talking. */
-#define VP_ARM_IGNORE_MS    500u
+#define VP_ARM_IGNORE_MS    900u /* whole wake word, not just its tail */
 /* VADNet frames are ~30 ms: 3 consecutive SPEECH frames (~90 ms) confirm.
  * Isolated music blips never streak; real speech always does. */
 #define VP_VAD_CONFIRM_FRAMES 2u
@@ -239,6 +240,7 @@ static void vp_uplink_task(void *arg)
                 s_closing = false;
                 s_listen_sent = false;
                 s_vad_seen = false;
+                s_speech_ms = 0;
                 s_arm_tick = now;
                 s_quiet_since = now;
                 s_window_open_tick = now;
@@ -255,6 +257,10 @@ static void vp_uplink_task(void *arg)
         if (s_streaming) {
             if (wakeword_vad_streak() >= VP_VAD_CONFIRM_FRAMES) {
                 s_vad_seen = true;
+            }
+            if (wakeword_vad_speech_now()
+                && (int32_t)(now - s_arm_tick) >= (int32_t)pdMS_TO_TICKS(VP_ARM_IGNORE_MS)) {
+                s_speech_ms += 60; /* real user speech, wake word excluded */
             }
             /* No real speech after wake: abort silently. Closing the socket
              * (instead of listen stop) means the server cannot deliver its
@@ -290,6 +296,18 @@ static void vp_uplink_task(void *arg)
                        && (int32_t)(now - s_quiet_since) >= (int32_t)pdMS_TO_TICKS(VP_WINDOW_QUIET_MS)) {
                 s_streaming = false;
                 s_armed = false;
+                if (s_speech_ms < 600) {
+                    /* Only a blip (click/TV/noise): never ask the server to
+                     * answer it. Dropping the socket is silent by design. */
+                    ESP_LOGI(TAG, "window closed: only %lums speech, silent abort",
+                             (unsigned long)s_speech_ms);
+                    vp_set_screen_listen(false);
+                    s_closing = false;
+                    if (s_close_cb) {
+                        s_close_cb();
+                    }
+                    continue;
+                }
                 vp_send_listen_stop();
                 /* Do NOT drop the channel yet: the server answers right after
                  * listen stop, and closing here cut the reply off (live-tested
@@ -332,6 +350,18 @@ static void vp_uplink_task(void *arg)
              * "Alexa" and answer it ("Chào sếp..."). Keep the queue fresh. */
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
+        }
+
+        /* Once real speech has been heard, stop transmitting during silence:
+         * trailing room noise was transcribed as "đây" and the server answered
+         * it ("Dạ em đây..."), so every question got a second reply. */
+        if (s_vad_seen) {
+            TickType_t last_sp = wakeword_vad_last_speech_tick();
+            if ((int32_t)(now - last_sp) > (int32_t)pdMS_TO_TICKS(400)) {
+                audio_in_pop_opus(buf, sizeof(buf), 0); /* keep queue fresh */
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
         }
 
         int n = audio_in_pop_opus(buf, sizeof(buf), VP_POP_TIMEOUT_MS);
