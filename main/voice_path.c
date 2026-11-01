@@ -538,7 +538,7 @@ static void vp_uplink_task(void *arg)
          * it ("Dạ em đây..."), so every question got a second reply. */
         if (s_vad_seen) {
             TickType_t last_sp = wakeword_vad_last_speech_tick();
-            if ((int32_t)(now - last_sp) > (int32_t)pdMS_TO_TICKS(400)) {
+            if ((int32_t)(now - last_sp) > (int32_t)pdMS_TO_TICKS(200)) {
                 /* Silence: keep only a short onset pre-roll instead of
                  * transmitting room noise. Without it the first phoneme was
                  * lost before VAD confirmed the next word. */
